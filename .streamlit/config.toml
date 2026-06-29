@@ -1,0 +1,87 @@
+# Streamlit theme for the RT Shift Scheduler.
+#
+# Goal: a calm, modern, clinical chrome that ties the UI to the exported Excel
+# workbook (header navy #305496) WITHOUT competing with the roster grid. The
+# color-coded grid (green/blue/pink from scheduler.WEB_COLORS) must stay the most
+# saturated thing on screen, so every surface here is neutral and every semantic
+# alert color is intentionally muted.
+#
+# Typography: IBM Plex -- an engineered, precise type family (not a generic
+# system default) that reads as trustworthy for a data-dense operational tool.
+# Loaded from the Fontsource CDN below; if the network is unavailable it falls
+# back gracefully to the system sans/mono stack named in [theme].
+
+[theme]
+base = "light"
+
+# --- Core palette --------------------------------------------------------------
+primaryColor = "#305496"               # the Excel header navy -- ties UI to the .xlsx
+backgroundColor = "#FFFFFF"            # clean canvas; the grid's pastels pop on white
+secondaryBackgroundColor = "#F3F5F9"   # soft cool gray for the sidebar and cards
+textColor = "#1B2330"                  # near-black with a cool tint
+linkColor = "#305496"
+
+# --- Typography ----------------------------------------------------------------
+font = "IBM Plex Sans, ui-sans-serif, system-ui, -apple-system, sans-serif"
+headingFont = "IBM Plex Sans, ui-sans-serif, system-ui, sans-serif"
+codeFont = "IBM Plex Mono, ui-monospace, SFMono-Regular, Menlo, monospace"
+baseFontSize = 15
+
+# --- Shape + borders (gentle, restrained chrome) -------------------------------
+baseRadius = "medium"
+buttonRadius = "medium"
+borderColor = "#E4E8F0"
+showSidebarBorder = true
+showWidgetBorder = false               # keep inputs calm; lean on the gray surfaces
+dataframeHeaderBackgroundColor = "#EEF2F8"   # light header so the COLORED cells lead
+dataframeBorderColor = "#E4E8F0"
+
+# --- Muted, workbook-tied semantic colors --------------------------------------
+# These tint st.success / st.error / st.info / st.warning and st.badge. Kept soft
+# and desaturated so the roster grid remains the visual hero.
+greenColor = "#2E7D52"
+greenBackgroundColor = "#ECF6F0"
+greenTextColor = "#1E5638"
+redColor = "#C0392B"
+redBackgroundColor = "#FBEEEC"
+redTextColor = "#8E2A20"
+blueColor = "#305496"
+blueBackgroundColor = "#EDF1F9"
+blueTextColor = "#264273"
+orangeColor = "#B26B00"
+orangeBackgroundColor = "#FBF2E0"
+orangeTextColor = "#80500A"
+yellowColor = "#8A6D00"
+yellowBackgroundColor = "#FBF6E2"
+yellowTextColor = "#6B5400"
+
+# --- Web fonts (IBM Plex via the Fontsource CDN) -------------------------------
+[[theme.fontFaces]]
+family = "IBM Plex Sans"
+url = "https://cdn.jsdelivr.net/fontsource/fonts/ibm-plex-sans@latest/latin-400-normal.woff2"
+weight = 400
+style = "normal"
+
+[[theme.fontFaces]]
+family = "IBM Plex Sans"
+url = "https://cdn.jsdelivr.net/fontsource/fonts/ibm-plex-sans@latest/latin-500-normal.woff2"
+weight = 500
+style = "normal"
+
+[[theme.fontFaces]]
+family = "IBM Plex Sans"
+url = "https://cdn.jsdelivr.net/fontsource/fonts/ibm-plex-sans@latest/latin-600-normal.woff2"
+weight = 600
+style = "normal"
+
+[[theme.fontFaces]]
+family = "IBM Plex Sans"
+url = "https://cdn.jsdelivr.net/fontsource/fonts/ibm-plex-sans@latest/latin-700-normal.woff2"
+weight = 700
+style = "normal"
+
+[[theme.fontFaces]]
+family = "IBM Plex Mono"
+url = "https://cdn.jsdelivr.net/fontsource/fonts/ibm-plex-mono@latest/latin-500-normal.woff2"
+weight = 500
+style = "normal"

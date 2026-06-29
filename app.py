@@ -1,14 +1,34 @@
 #!/usr/bin/env python3
 """
-Streamlit front-end for the RT shift scheduler.
+Streamlit front-end for the RT shift scheduler  (calm, grid-first redesign).
 
-Drives `scheduler.py` entirely through a single `ScheduleSettings` object: pick a
-month + year, edit the staff, choose the night-coverage model, set every rule and
-fairness value, click Generate, then review the roster and the independent
-PASS/FAIL checks and download the color-coded Excel. The solver logic lives in
-`scheduler.py` and is reused as-is -- this file never re-implements a constraint;
-it only collects inputs (config) and renders outputs
-(preflight -> solve -> validate -> export).
+A THIN UI over scheduler.py. It only collects configuration into one
+ScheduleSettings object and renders the engine's outputs -- it never
+re-implements a constraint or recomputes a rule. Every number, count, spread,
+and PASS/FAIL on screen comes straight from a scheduler function/field
+(preflight -> build_and_solve -> validate -> export_bytes).
+
+Layout
+  Sidebar : configuration only -- month, staff, night model, staffing bands,
+            rules, and fairness (everything that builds ScheduleSettings). The
+            rarely-touched objective weights and solver budget live in expanders,
+            with one primary "Generate roster" button.
+  Main    : results, with the color-coded grid as the visual hero --
+              * a month header + compact metrics + a subtle solver status,
+              * a positive, next-step status banner (3-way: success / info / error),
+              * a prominent Excel download, then three tabs:
+                  Roster     -- the big color grid (hero), a legend, and a per-day
+                                coverage strip built from coverage_per_day().
+                  Fairness   -- the four soft goals as PASS/FAIL cards (spread vs
+                                tolerance), the per-employee summary, and the checks.
+                  Hard rules -- the independent hard-rule validation table.
+
+Three render states persist across reruns via st.session_state: the initial
+hint, a preflight "blocked" state (each Problem's message + suggestion), and an
+"infeasible" state (a positive error + the engine's relaxation hints).
+
+The grid colors come from scheduler.WEB_COLORS (mirrors the Excel fills) and the
+chrome from .streamlit/config.toml, so the web view and the workbook agree.
 
 Run:  ./.venv/bin/streamlit run app.py
 """
@@ -22,21 +42,63 @@ import streamlit as st
 
 import scheduler as sch
 
-st.set_page_config(page_title="RT Shift Scheduler", layout="wide")
-st.title("Respiratory Therapy — Monthly Shift Scheduler")
-st.caption("Configure any month and rule set, generate a fair roster, and download the Excel. "
-           "Every hard rule is enforced by the CP-SAT solver and re-checked by an independent "
-           "validator; fairness goals are reported with their measured spread.")
 
-defaults = sch.ScheduleSettings()
+# ---------------------------------------------------------------------------
+# PAGE + LIGHT GLOBAL POLISH
+# ---------------------------------------------------------------------------
+
+st.set_page_config(
+    page_title="RT Shift Scheduler",
+    page_icon=":material/calendar_month:",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# A small amount of CSS, scoped to OUR OWN markup only (a kicker label and the
+# grid legend) so we never fight Streamlit's internals across versions. Palette
+# and typography come from .streamlit/config.toml; grid colors from WEB_COLORS.
+st.markdown(
+    """
+    <style>
+      .kicker{font-size:.72rem;letter-spacing:.16em;font-weight:600;
+              color:#7A8194;text-transform:uppercase;margin:0 0 .15rem}
+      .legend{display:flex;flex-wrap:wrap;gap:.45rem 1.2rem;align-items:center;
+              font-size:.85rem;color:#5A6273;margin:.1rem 0 .35rem}
+      .legend-item{display:inline-flex;align-items:center;gap:.42rem}
+      .legend-sw{width:.95rem;height:.95rem;border-radius:.28rem;
+                 border:1px solid rgba(20,30,55,.12);display:inline-block}
+      .legend-code{font-weight:700;color:#1B2330}
+      .legend-star{color:#305496;font-weight:700;font-size:1.05rem;line-height:1}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+defaults = sch.ScheduleSettings()       # EVERY UI default is pulled from here
 
 
 # ---------------------------------------------------------------------------
-# SIDEBAR — every input that populates ScheduleSettings (config only)
+# APP HEADER  (constant identity; the month-specific header lives in results)
+# ---------------------------------------------------------------------------
+
+st.markdown('<div class="kicker">Respiratory Therapy &middot; Workforce</div>',
+            unsafe_allow_html=True)
+st.title("Monthly Shift Scheduler")
+st.caption(
+    "Configure a month, generate a fair roster, and download the color-coded "
+    "Excel. Every hard rule is enforced by the solver and independently "
+    "re-checked; the four fairness goals are reported with their measured spread.")
+st.divider()
+
+
+# ---------------------------------------------------------------------------
+# SIDEBAR  -- configuration only (every input that populates ScheduleSettings)
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
-    st.header("1 · Month")
+    st.markdown('<div class="kicker">Configuration</div>', unsafe_allow_html=True)
+
+    st.subheader("1 · Month")
     col_y, col_m = st.columns(2)
     year = col_y.number_input("Year", min_value=2000, max_value=2100,
                               value=defaults.year, step=1)
@@ -44,14 +106,16 @@ with st.sidebar:
                             index=defaults.month - 1,
                             format_func=lambda m: calendar.month_name[m])
 
-    st.header("2 · Staff")
+    st.subheader("2 · Staff")
     st.caption("Add, remove, or rename employees.")
     emp_df = st.data_editor(
         pd.DataFrame({"Employee": list(defaults.employees)}),
-        num_rows="dynamic", width="stretch", hide_index=True, key="emp_editor")
+        num_rows="dynamic", width="stretch", hide_index=True, key="emp_editor",
+        column_config={"Employee": st.column_config.TextColumn(
+            "Employee", width="large", help="One row per person.")})
     employees = [str(x).strip() for x in emp_df["Employee"].tolist() if str(x).strip()]
 
-    st.header("3 · Night coverage")
+    st.subheader("3 · Night coverage")
     mode_label = st.radio(
         "How are nights covered?",
         ["Fixed night team (nights only)", "Everyone rotates nights"],
@@ -60,6 +124,8 @@ with st.sidebar:
              "nights are spread across the whole roster.")
     rotation_mode = sch.FIXED_TEAM if mode_label.startswith("Fixed") else sch.ROTATE
 
+    # The night-team picker only appears for a fixed team (preserve the
+    # conditional and the "pick at least one" warning exactly).
     if rotation_mode == sch.FIXED_TEAM:
         night_team = st.multiselect(
             "Night team (any size ≥ 1 — they work nights only)",
@@ -73,7 +139,7 @@ with st.sidebar:
         night_team = []
         st.caption("All staff are night-eligible; nights rotate across everyone.")
 
-    st.header("4 · Staffing per day")
+    st.subheader("4 · Staffing per day")
     c1, c2 = st.columns(2)
     day_min = c1.number_input("Min day staff", 0, 50, defaults.day_min)
     day_max = c2.number_input("Max day staff", 1, 50, defaults.day_max)
@@ -81,29 +147,35 @@ with st.sidebar:
     night_min = c3.number_input("Min nights/day", 0, 10, defaults.night_min)
     night_max = c4.number_input("Max nights/day (overlap)", 1, 10, defaults.night_max)
 
-    st.header("5 · Rules")
-    shifts = st.number_input("Shifts per employee (exact)", 1, 31, defaults.shifts_per_employee)
+    st.subheader("5 · Rules")
+    shifts = st.number_input("Shifts per employee (exact)", 1, 31,
+                             defaults.shifts_per_employee)
     c5, c6 = st.columns(2)
     max_day = c5.number_input("Max consecutive day shifts", 1, 14, defaults.max_consec_work)
     max_night = c6.number_input("Max consecutive nights", 1, 14, defaults.max_consec_night)
     c7, c8 = st.columns(2)
-    min_work = c7.number_input("Min consecutive work", 2, 7, defaults.min_consec_work)
-    min_off = c8.number_input("Min consecutive off", 2, 7, defaults.min_consec_off)
+    min_work = c7.number_input("Min consecutive work", 2, 7, defaults.min_consec_work,
+                               help="The model encodes a minimum of 2; other values are "
+                                    "reported as infeasible by preflight.")
+    min_off = c8.number_input("Min consecutive off", 2, 7, defaults.min_consec_off,
+                              help="The model encodes a minimum of 2; other values are "
+                                   "reported as infeasible by preflight.")
     max_off = st.number_input("Max consecutive off", 1, 14, defaults.max_consec_off)
 
-    st.header("6 · Fairness")
+    st.subheader("6 · Fairness")
     st.caption("All four fairness goals are soft. A goal PASSES when its spread "
                "(max − min) is within tolerance.")
     c9, c10 = st.columns(2)
     tol_nw = c9.number_input("Night/weekend tolerance", 0, 10, defaults.fair_tol_night)
     tol_runs = c10.number_input("Runs tolerance", 0, 10, defaults.fair_tol_runs)
-    with st.expander("Objective weights (equal ⇒ the goals matter equally)"):
+
+    with st.expander("Objective weights (equal ⇒ goals matter equally)"):
         w_total = st.number_input("Equal total shifts", 0, 1000, defaults.w_fair_total, step=10)
         w_night = st.number_input("Balanced night load", 0, 1000, defaults.w_fair_night, step=10)
         w_weekend = st.number_input("Balanced weekends", 0, 1000, defaults.w_fair_weekend, step=10)
         w_runs = st.number_input("Balanced undesirable runs", 0, 1000, defaults.w_fair_runs, step=10)
 
-    with st.expander("Advanced · solver"):
+    with st.expander("Advanced · solver budget"):
         det_budget = st.number_input(
             "Solver budget (deterministic units)", 4.0, 240.0,
             float(defaults.solver_det_time_limit), step=4.0,
@@ -111,11 +183,18 @@ with st.sidebar:
                  "(especially rotate mode), at the cost of solve time. The budget is "
                  "deterministic, so the roster is reproducible regardless of machine speed.")
 
-    generate = st.button("Generate roster", type="primary", width="stretch")
+    st.divider()
+    generate = st.button("Generate roster", type="primary", width="stretch",
+                         icon=":material/bolt:")
 
 
 def make_settings() -> sch.ScheduleSettings:
-    """Collect every sidebar input into the single ScheduleSettings object."""
+    """Collect every sidebar input into the single ScheduleSettings object.
+
+    Note: one "Night/weekend tolerance" input feeds BOTH fair_tol_night and
+    fair_tol_weekend (preserved from the prior app). No scheduling value is
+    hard-coded here -- defaults all come from sch.ScheduleSettings().
+    """
     return sch.ScheduleSettings(
         year=int(year), month=int(month),
         employees=employees, rotation_mode=rotation_mode, night_team=night_team,
@@ -134,12 +213,13 @@ def make_settings() -> sch.ScheduleSettings:
 
 
 # ---------------------------------------------------------------------------
-# RENDER HELPERS  (display only — never recompute a rule)
+# DISPLAY HELPERS  (display only -- never recompute a rule or a scheduling fact)
 # ---------------------------------------------------------------------------
 
 def grid_dataframe(S: sch.ScheduleSettings, grid: list[list[str]]) -> pd.DataFrame:
+    """The roster as a DataFrame: rows = employees, columns = D1..Dn (weekday)."""
     cols = [f"D{d + 1} {sch.weekday_of(S, d)}" for d in range(S.days)]
-    rows = [S.employees[e] + (" *" if sch.is_night_member(S, e) else "")
+    rows = [S.employees[e] + (" ∗" if sch.is_night_member(S, e) else "")
             for e in range(len(S.employees))]
     data = [[sch.CELL_LABEL[grid[e][d]] for d in range(S.days)]
             for e in range(len(S.employees))]
@@ -150,25 +230,85 @@ def color_cell(val: str) -> str:
     """Mirror the openpyxl fills so the web grid matches the Excel exactly."""
     code = {"D": sch.DAY, "N": sch.NIGHT, "OFF": sch.OFF}.get(val)
     bg = sch.WEB_COLORS.get(code, "#FFFFFF")
-    return f"background-color: {bg}; text-align: center; color: #111;"
+    return f"background-color: {bg}; text-align: center; color: #13233B; font-weight: 600;"
 
 
 def color_result(val: str) -> str:
+    """PASS/FAIL cell color, reusing the grid's green/pink so the views agree."""
     if val == "PASS":
-        return f"background-color: {sch.WEB_COLORS[sch.DAY]}; color: #111;"
+        return f"background-color: {sch.WEB_COLORS[sch.DAY]}; color: #13233B; font-weight: 600;"
     if val == "FAIL":
-        return f"background-color: {sch.WEB_COLORS[sch.OFF]}; color: #111;"
+        return f"background-color: {sch.WEB_COLORS[sch.OFF]}; color: #13233B; font-weight: 600;"
     return ""
 
 
-def show_problems(title: str, problems) -> None:
-    """Surface each preflight Problem's message AND its suggestion."""
-    st.error(f"**{title}**")
-    for p in problems:
-        st.markdown(f"- {p.message}  \n  💡 *{p.suggestion}*")
+def legend() -> None:
+    """A compact key whose swatches are the EXACT grid colors (WEB_COLORS)."""
+    items = [(sch.WEB_COLORS[sch.DAY], "D", "Day"),
+             (sch.WEB_COLORS[sch.NIGHT], "N", "Night"),
+             (sch.WEB_COLORS[sch.OFF], "OFF", "Off")]
+    html = ['<div class="legend">']
+    for bg, code, label in items:
+        html.append(
+            f'<span class="legend-item"><span class="legend-sw" '
+            f'style="background:{bg}"></span><span class="legend-code">{code}</span>'
+            f'&nbsp;{label}</span>')
+    html.append('<span class="legend-item"><span class="legend-star">∗</span>'
+                '&nbsp;Night-team member</span>')
+    html.append('</div>')
+    st.markdown("".join(html), unsafe_allow_html=True)
+
+
+def render_grid(S: sch.ScheduleSettings, grid: list[list[str]]) -> None:
+    """The hero: the full color-coded roster. Comfortable rows, all employees in
+    view (it scrolls only for very large teams / long months)."""
+    gdf = grid_dataframe(S, grid)
+    row_h = 39
+    height = min(48 + row_h * len(gdf), 660)
+    st.dataframe(gdf.style.map(color_cell), width="stretch",
+                 height=height, row_height=row_h)
+
+
+def render_coverage(S: sch.ScheduleSettings, grid: list[list[str]]) -> None:
+    """Per-day coverage strip from coverage_per_day(): a compact day/night table
+    that rhymes with the roster's columns. Weekend (Fri/Sat) columns are washed
+    amber and forced-overlap nights (over_floor) are emphasized -- all read
+    straight from the engine's per-day facts, nothing recomputed here."""
+    cov = sch.coverage_per_day(S, grid)
+    cols = [c["label"] for c in cov]
+    is_wknd = [c["is_weekend"] for c in cov]
+    over = [c["over_floor"] for c in cov]
+    df = pd.DataFrame(
+        [[c["day"] for c in cov], [c["night"] for c in cov]],
+        index=["Day staff", "Night staff"], columns=cols)
+
+    def _styles(_df: pd.DataFrame) -> pd.DataFrame:
+        css = pd.DataFrame("", index=_df.index, columns=_df.columns)
+        for j in range(len(_df.columns)):
+            wk, ov = is_wknd[j], over[j]
+            # Row 0 -- day staff: light green, amber on weekends.
+            css.iloc[0, j] = (
+                f"background-color: {'#F6F1DD' if wk else '#F1F8F3'}; "
+                "text-align: center; color: #2C3A30; font-weight: 500;")
+            # Row 1 -- night staff: light blue; deeper blue + bold on overlap days.
+            if ov:
+                nbg, ncol, nwt = "#D6E2F4", "#1F3A66", 700
+            elif wk:
+                nbg, ncol, nwt = "#F6F1DD", "#2B3550", 500
+            else:
+                nbg, ncol, nwt = "#EEF3FA", "#2B3550", 500
+            css.iloc[1, j] = (f"background-color: {nbg}; text-align: center; "
+                              f"color: {ncol}; font-weight: {nwt};")
+        return css
+
+    st.dataframe(df.style.apply(_styles, axis=None), width="stretch",
+                 height=36 + 36 * len(df), row_height=36)
+    st.caption("Staff on duty each day. Amber columns are the Fri/Sat weekend; a "
+               "deeper-blue night cell is a forced extra (overlap) night above the floor.")
 
 
 def render_checks(rule_results) -> None:
+    """A scannable PASS/FAIL table for a list of RuleResults (display only)."""
     checks = pd.DataFrame({
         "Rule": [r.name for r in rule_results],
         "Result": ["PASS" if r.passed else "FAIL" for r in rule_results],
@@ -177,11 +317,50 @@ def render_checks(rule_results) -> None:
     st.dataframe(
         checks.style.map(color_result, subset=["Result"]),
         width="stretch", hide_index=True,
-        height=min(80 + 35 * len(checks), 600))
+        height=min(80 + 35 * len(checks), 600),
+        column_config={
+            "Rule": st.column_config.TextColumn(width="large"),
+            "Result": st.column_config.TextColumn(width="small"),
+            "Measured": st.column_config.TextColumn(width="medium"),
+        })
+
+
+def render_problems(title: str, problems) -> None:
+    """Surface each preflight Problem's message AND its suggestion."""
+    st.error(f"**{title}**")
+    for p in problems:
+        st.markdown(f"- {p.message}  \n  💡 *{p.suggestion}*")
+
+
+def status_banner(hard, fairness) -> None:
+    """Positive, next-step status. Preserves the prior three-way logic exactly:
+    hard fail -> error; all hard pass but a soft goal misses -> info; all -> success."""
+    hard_fail = [r for r in hard if not r.passed]
+    soft_fail = [r for r in fairness if not r.passed]
+    if not hard_fail and not soft_fail:
+        st.success("All rules pass — this roster is ready to publish.")
+    elif not hard_fail:
+        # Fairness goals are soft: a miss means the roster is still valid (every
+        # hard rule holds), just not perfectly balanced this month.
+        st.info(
+            f"All hard safety rules pass — this roster is valid and ready to publish. "
+            f"{len(soft_fail)} soft fairness goal(s) couldn't be fully balanced this "
+            f"month (see the spread in the **Fairness** tab). Loosen a fairness "
+            f"tolerance or raise the solver budget to push the balance further.")
+    else:
+        st.error(
+            f"{len(hard_fail)} hard rule(s) failed — do not publish. Open the "
+            f"**Hard rules** tab to see which constraint was violated.")
+
+
+def short_goal(name: str) -> str:
+    """'Fairness - balanced night load (spread <= 1)' -> 'Balanced Night Load'."""
+    return name.replace("Fairness - ", "").split(" (")[0].title()
 
 
 # ---------------------------------------------------------------------------
-# GENERATE  (config -> preflight -> solve -> validate -> export)
+# GENERATE  (config -> preflight -> solve -> validate -> export); results persist
+# in st.session_state so they survive Streamlit reruns.
 # ---------------------------------------------------------------------------
 
 if generate:
@@ -189,6 +368,7 @@ if generate:
     problems = sch.preflight(S)
     if problems:
         st.session_state.pop("result", None)
+        st.session_state.pop("infeasible", None)
         st.session_state["blocked"] = problems
     else:
         st.session_state.pop("blocked", None)
@@ -196,7 +376,8 @@ if generate:
             sol = sch.build_and_solve(S)
         if not sol.grid:
             st.session_state.pop("result", None)
-            st.session_state["infeasible"] = {"status": sol.status, "hints": sch.relaxation_hints(S)}
+            st.session_state["infeasible"] = {
+                "status": sol.status, "hints": sch.relaxation_hints(S)}
         else:
             st.session_state.pop("infeasible", None)
             results = sch.validate(S, sol.grid)
@@ -208,17 +389,19 @@ if generate:
 
 
 # ---------------------------------------------------------------------------
-# RENDER  (top-down: blocked? infeasible? else roster -> fairness -> rules)
+# RENDER  (blocked? infeasible? else the result; otherwise the initial hint)
 # ---------------------------------------------------------------------------
 
 if "blocked" in st.session_state:
-    show_problems("This rule combination has no valid schedule — preflight stopped "
-                  "before solving.", st.session_state["blocked"])
+    render_problems(
+        "This rule combination has no valid schedule — preflight stopped before "
+        "solving.", st.session_state["blocked"])
 
 if "infeasible" in st.session_state:
     info = st.session_state["infeasible"]
-    st.error(f"The solver could not satisfy every hard rule (status: {info['status']}). "
-             "The conflict is a combination of rules, not a single value. Try one of:")
+    st.error(
+        f"The solver could not satisfy every hard rule (status: {info['status']}). "
+        "The conflict is a combination of rules, not a single value. Try one of:")
     for hint in info["hints"]:
         st.markdown(f"- 💡 {hint}")
 
@@ -226,71 +409,101 @@ if "result" in st.session_state:
     R = st.session_state["result"]
     S = R["settings"]
     results = R["results"]
-    fairness = [r for r in results if r.name.startswith("Fairness")]
-    hard = [r for r in results if not r.name.startswith("Fairness")]
-    all_pass = all(r.passed for r in results)
+    # Split hard vs fairness via the structured `kind` field (not by name).
+    fairness = [r for r in results if r.kind == "fairness"]
+    hard = [r for r in results if r.kind != "fairness"]
+    passed = sum(1 for r in results if r.passed)
 
-    # --- Headline -------------------------------------------------------
-    top = st.columns([2, 1, 1, 1])
-    top[0].subheader(f"{S.month_label} · {S.days} days")
-    top[1].metric("Employees", len(S.employees))
-    top[2].metric("Rules passed", f"{sum(r.passed for r in results)}/{len(results)}")
-    top[3].metric("Solver", R["status"])
-    st.caption(sch.roster_caption(S))
+    # --- Month header + compact metrics + a subtle solver status ------------
+    head_l, head_r = st.columns([2.3, 1.4])
+    with head_l:
+        st.markdown('<div class="kicker">Monthly Roster</div>', unsafe_allow_html=True)
+        st.subheader(f"{S.month_label} · {S.days} days")
+        st.caption(sch.roster_caption(S))
+        st.badge(f"Solver · {R['status']}", color="gray",
+                 icon=":material/check_small:")
+    with head_r:
+        m1, m2 = st.columns(2)
+        m1.metric("Employees", len(S.employees), border=True)
+        m2.metric("Rules passed", f"{passed}/{len(results)}", border=True)
 
-    hard_fail = [r for r in hard if not r.passed]
-    soft_fail = [r for r in fairness if not r.passed]
-    if all_pass:
-        st.success("All rules PASS — safe to publish.")
-    elif not hard_fail:
-        # Fairness goals are soft/best-effort: a miss means the roster is still
-        # valid (every hard rule holds), just not perfectly balanced this month.
-        st.info(f"All hard rules pass — the roster is valid and safe to publish. "
-                f"{len(soft_fail)} soft fairness goal(s) couldn't be fully met this "
-                f"month (see **Fairness goals** below for the spread). Loosen a "
-                f"tolerance or raise the solver budget to push further.")
-    else:
-        st.error(f"{len(hard_fail)} HARD rule(s) FAILED — do not publish. "
-                 f"Review the hard-rule checks below.")
+    # --- Positive, next-step status banner ----------------------------------
+    status_banner(hard, fairness)
 
-    st.download_button(
-        "⬇ Download Excel (.xlsx)", data=R["xlsx"],
+    # --- Prominent export, near the top of the results ----------------------
+    dl, _ = st.columns([1.4, 3])
+    dl.download_button(
+        "Download Excel (.xlsx)", data=R["xlsx"],
         file_name=f"schedule_{S.year}_{S.month:02d}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary")
+        type="primary", icon=":material/download:", width="stretch")
 
-    # --- Roster ---------------------------------------------------------
-    st.markdown("#### Roster  · `D` day · `N` night · `OFF` off · `*` night team")
-    gdf = grid_dataframe(S, R["grid"])
-    st.dataframe(gdf.style.map(color_cell), width="stretch",
-                 height=min(80 + 35 * len(gdf), 500))
+    st.write("")
+    tab_roster, tab_fair, tab_hard = st.tabs(["Roster", "Fairness", "Hard rules"])
 
-    # --- Per-employee fairness summary ----------------------------------
-    st.markdown("#### Per-employee fairness summary")
-    loads = sch.employee_loads(S, R["grid"])
-    fair_df = pd.DataFrame([{
-        "Employee": ld["name"] + (" *" if ld["night_member"] else ""),
-        "Total": ld["total"], "Day": ld["day"], "Night": ld["night"],
-        "Fri/Sat": ld["weekend"], "Weekends off": ld["weekends_off"],
-        "Overlaps": ld["overlaps"], "Max-runs": ld["max_runs"],
-    } for ld in loads])
-    st.dataframe(fair_df, width="stretch", hide_index=True)
-    st.caption("Overlaps = forced extra-night days worked · Max-runs = max-length "
-               "day/night streaks absorbed · these spread evenly within each pool.")
+    # ======================= ROSTER (the hero) ==============================
+    with tab_roster:
+        legend()
+        render_grid(S, R["grid"])
+        st.divider()
+        st.markdown("##### Daily coverage")
+        render_coverage(S, R["grid"])
 
-    # --- Fairness goals (the business priority) -------------------------
-    st.markdown("#### Fairness goals")
-    fcols = st.columns(len(fairness))
-    for col, r in zip(fcols, fairness):
-        short = r.name.replace("Fairness - ", "").split(" (")[0]
-        col.metric(short.title(), "PASS" if r.passed else "FAIL",
-                   delta=r.measured.split("  ")[0], delta_color="off")
-    render_checks(fairness)
+    # ======================= FAIRNESS =======================================
+    with tab_fair:
+        st.markdown("##### Fairness goals")
+        st.caption("Four soft, equally-weighted goals. Each PASSES when its measured "
+                   "spread (max − min) is within tolerance.")
+        cards = st.columns(len(fairness))
+        for col, r in zip(cards, fairness):
+            with col.container(border=True):
+                st.markdown(f"**{short_goal(r.name)}**")
+                if r.passed:
+                    st.badge("PASS", color="green", icon=":material/check_circle:")
+                else:
+                    st.badge("FAIL", color="red", icon=":material/cancel:")
+                st.caption(f"spread {r.spread} · tol {r.tolerance}")
+                # A goal can sit within tolerance yet still FAIL on a non-spread
+                # condition (e.g. the weekends goal also wants a full Fri+Sat off
+                # for everyone). Say so, so the card never looks self-contradictory;
+                # the full reason is in the checks table below.
+                if (not r.passed and r.spread is not None
+                        and r.tolerance is not None and r.spread <= r.tolerance):
+                    st.caption("Within tolerance, but another fairness condition "
+                               "isn't met — see the checks below.")
 
-    # --- All hard rules -------------------------------------------------
-    st.markdown("#### Hard-rule validation")
-    render_checks(hard)
+        st.divider()
+        st.markdown("##### Per-employee summary")
+        loads = sch.employee_loads(S, R["grid"])
+        fair_df = pd.DataFrame([{
+            "Employee": ld["name"] + (" ∗" if ld["night_member"] else ""),
+            "Total": ld["total"], "Day": ld["day"], "Night": ld["night"],
+            "Fri/Sat": ld["weekend"], "Weekends off": ld["weekends_off"],
+            "Overlaps": ld["overlaps"], "Max-runs": ld["max_runs"],
+        } for ld in loads])
+        st.dataframe(fair_df, width="stretch", hide_index=True,
+                     height=min(80 + 35 * len(fair_df), 460))
+        st.caption("Overlaps = forced extra-night days worked · Max-runs = max-length "
+                   "day/night streaks absorbed · both are balanced within each pool "
+                   "(day-capable vs night-eligible).")
+
+        st.divider()
+        st.markdown("##### Fairness checks")
+        render_checks(fairness)
+
+    # ======================= HARD RULES =====================================
+    with tab_hard:
+        st.markdown("##### Hard-rule validation")
+        st.caption("Every hard rule re-derived independently from the finished grid. "
+                   "These are non-negotiable — all must PASS to publish.")
+        render_checks(hard)
 
 elif "blocked" not in st.session_state and "infeasible" not in st.session_state:
-    st.info("Set your month, staff, night model, rules, and fairness in the sidebar, "
-            "then click **Generate roster**.")
+    # --- Initial / empty state: a calm hint -------------------------------
+    with st.container(border=True):
+        st.markdown("##### Build a monthly roster")
+        st.markdown(
+            "Set the month, staff, night-coverage model, and rules in the sidebar, "
+            "then press **Generate roster**. You'll get a color-coded grid, an "
+            "independent PASS/FAIL check of every rule, and a one-click Excel export.")
+        legend()

@@ -620,6 +620,14 @@ class RuleResult:
     name: str
     passed: bool
     measured: str
+    # --- Optional structured display metadata (set for fairness goals) ------
+    # Purely additive: lets a front-end render the spread/tolerance beside each
+    # fairness goal and split hard vs fairness checks without string-parsing
+    # `name`/`measured`. Never consulted by the solver or the validator's
+    # pass/fail logic -- the booleans above remain the single source of truth.
+    kind: str = "hard"                 # "hard" | "fairness"
+    spread: int | None = None          # measured spread (max - min) for fairness
+    tolerance: int | None = None       # tolerance the spread is checked against
 
 
 def _runs(seq: list[bool]) -> list[int]:
@@ -667,6 +675,33 @@ def employee_loads(settings: ScheduleSettings, grid: list[list[str]]) -> list[di
                                 if row[f] == OFF and row[s] == OFF),
         })
     return loads
+
+
+def coverage_per_day(settings: ScheduleSettings, grid: list[list[str]]) -> list[dict]:
+    """Per-day staffing counts, re-derived from the grid (display only).
+
+    Independent re-derivation -- reads only the finished grid (like
+    employee_loads), never the solver or the validator. Lets a front-end draw a
+    per-day coverage strip without recomputing any rule. `over_floor` flags a
+    day carrying a stacked night above night_min (a forced-overlap day).
+    """
+    S = settings
+    n = len(S.employees)
+    out = []
+    for d in range(S.days):
+        day_n = sum(1 for e in range(n) if grid[e][d] == DAY)
+        night_n = sum(1 for e in range(n) if grid[e][d] == NIGHT)
+        out.append({
+            "day_index": d,
+            "label": f"D{d + 1}",
+            "weekday": weekday_of(S, d),
+            "is_weekend": weekday_of(S, d) in S.weekend_days,
+            "day": day_n,
+            "night": night_n,
+            "off": n - day_n - night_n,
+            "over_floor": night_n >= S.night_min + 1,
+        })
+    return out
 
 
 def validate(settings: ScheduleSettings, grid: list[list[str]]) -> list[RuleResult]:
@@ -799,7 +834,8 @@ def validate(settings: ScheduleSettings, grid: list[list[str]]) -> list[RuleResu
     results.append(RuleResult(
         f"Fairness - equal total shifts (spread <= {S.fair_tol_total})",
         sp_total <= S.fair_tol_total,
-        f"spread={sp_total} (every total = {S.shifts_per_employee})"))
+        f"spread={sp_total} (every total = {S.shifts_per_employee})",
+        kind="fairness", spread=sp_total, tolerance=S.fair_tol_total))
 
     # F2 -- balanced night load across night-eligible staff.
     night_by = {loads[e]["name"]: loads[e]["night"] for e in elig}
@@ -807,7 +843,8 @@ def validate(settings: ScheduleSettings, grid: list[list[str]]) -> list[RuleResu
     results.append(RuleResult(
         f"Fairness - balanced night load (spread <= {S.fair_tol_night})",
         sp_night <= S.fair_tol_night,
-        f"spread={sp_night}  nights/eligible={night_by}"))
+        f"spread={sp_night}  nights/eligible={night_by}",
+        kind="fairness", spread=sp_night, tolerance=S.fair_tol_night))
 
     # F3 -- balanced weekends: even Fri/Sat duty in each pool + a weekend off each.
     sp_wknd_day = spread(sum(1 for d in weekend_days if grid[e][d] == DAY) for e in day_cap)
@@ -820,7 +857,9 @@ def validate(settings: ScheduleSettings, grid: list[list[str]]) -> list[RuleResu
         f"Fairness - balanced weekends (spread <= {S.fair_tol_weekend}, a weekend off each)",
         passed_wknd,
         f"day spread={sp_wknd_day}, night spread={sp_wknd_night}, "
-        f"no weekend-off for: {no_weekend_off or 'none'}"))
+        f"no weekend-off for: {no_weekend_off or 'none'}",
+        kind="fairness", spread=max(sp_wknd_day, sp_wknd_night),
+        tolerance=S.fair_tol_weekend))
 
     # F4 -- balanced undesirable runs *within* each pool (a fixed night team
     # structurally carries all overlap; comparing it to the day team is not a
@@ -831,7 +870,8 @@ def validate(settings: ScheduleSettings, grid: list[list[str]]) -> list[RuleResu
     results.append(RuleResult(
         f"Fairness - balanced undesirable runs (within-pool spread <= {S.fair_tol_runs})",
         sp_rough <= S.fair_tol_runs,
-        f"within-pool spread={sp_rough}  rough-load(overlap+max-runs)={rough_by}"))
+        f"within-pool spread={sp_rough}  rough-load(overlap+max-runs)={rough_by}",
+        kind="fairness", spread=sp_rough, tolerance=S.fair_tol_runs))
 
     return results
 
