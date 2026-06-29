@@ -1,0 +1,4 @@
+ortools>=9.7
+openpyxl>=3.1
+streamlit>=1.30
+pandas>=2.1

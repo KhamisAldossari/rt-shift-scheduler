@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environment (machine-specific, do not publish)
+.venv/
+venv/
+env/
+
+# OMC / assistant state
+.omc/
+
+# Generated output (regenerate with the app or `python scheduler.py`)
+schedule.xlsx
+*.xlsx
+!example_schedule.xlsx
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
