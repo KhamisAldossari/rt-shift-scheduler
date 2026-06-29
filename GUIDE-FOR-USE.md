@@ -12,7 +12,8 @@ You don't need to know any coding. Just follow the steps below.
 
 - Splits the month into **Day (D)**, **Night (N)**, and **Off (OFF)** shifts for each person.
 - Makes sure **everyone works exactly 16 shifts** — nobody does more, nobody does less.
-- Keeps **2 people on nights** for the whole month (they never do day shifts).
+- Covers nights either with a **dedicated night team** (any number of people, who never do
+  day shifts) **or** by **rotating nights across everyone** — your choice.
 - Follows safety rules automatically:
   - never a **night shift followed by a day shift** the next morning,
   - never more than **4 day shifts** in a row, or **3 nights** in a row,
@@ -62,13 +63,16 @@ You'll see a small table of names (Employee 1, Employee 2, …).
 - **Add** a person with the **+** at the bottom of the table.
 - **Remove** a person by selecting their row and deleting it.
 
-Then, under **Night team**, pick the **2 people** who will cover nights that month.
-(Pick exactly 2 — the tool reminds you if you don't.)
+Then, under **Night coverage**, choose how nights are handled:
+- **Fixed night team** — pick the people who cover nights that month (any number; they work
+  nights only). Or
+- **Everyone rotates nights** — no fixed team; the tool shares nights across all staff.
 
 ### 3 · Staffing per day
 - **Min / Max day staff** — how many people you want on days each day (default 2–4).
-- **Min / Max nights per day** — leave at **1 and 2**. The "2" lets the two night people
-  finish their 16 shifts; the tool only uses a 2nd night on the few days it has to.
+- **Min / Max nights per day** — leave at **1 and 2** for a 2-person team. The "max" lets the
+  night people finish their 16 shifts; the tool only stacks an extra night on the few days it
+  has to. (A bigger night team may need a higher max — the tool tells you if so.)
 
 ### 4 · Rules
 These are pre-set to safe values. You usually don't need to touch them:
@@ -84,14 +88,21 @@ Click the big **Generate roster** button.
 ## Reading the result
 
 - A green banner **"All rules PASS — safe to publish"** means you're good to go. 🎉
+- A **blue** banner means **all the safety rules pass and the roster is valid**, but one
+  *fairness* goal couldn't be made perfect this month (only happens on unusually tight
+  months) — it's still safe to publish; you can loosen a tolerance or raise the solver
+  budget if you want it even more even.
+- A **red** banner would mean a **safety rule** failed — don't publish (this shouldn't happen).
 - The **Roster** table shows everyone's month:
   - 🟩 **D** = Day shift
   - 🟦 **N** = Night shift
   - 🟥 **OFF** = Day off
   - a small **\*** next to a name = night-team member
-- The **Per-employee totals** table shows each person's Total / Day / Night / Fri-Sat counts.
-- The **Rule validation** table lists every safety & fairness rule with a green **PASS**
-  or red **FAIL**.
+- The **Per-employee fairness summary** shows each person's Total / Day / Night / Fri-Sat and
+  how many rough patterns (overlap nights, long streaks) they got — so you can see the load
+  is shared evenly.
+- The **Fairness goals** and **Hard-rule validation** tables list every rule with a green
+  **PASS** or red **FAIL**, plus the actual numbers.
 
 ### Download it
 Click **⬇ Download Excel (.xlsx)** to save the schedule. It's the same colored table plus
@@ -113,8 +124,9 @@ you a schedule that quietly breaks a rule — it would rather stop and tell you.
 ## Why some rules are the way they are
 
 - **Exactly 16 shifts** keeps the workload equal for everyone.
-- **Only 2 night people** means dedicated, rested night staff instead of everyone flipping
-  between days and nights.
+- **A dedicated night team** (when you choose one) means rested night staff instead of
+  everyone flipping between days and nights — or you can rotate nights across everyone if you
+  prefer.
 - **No night → day next morning** protects against the most tiring, error-prone pattern.
 - **Max 3 nights / 4 days in a row** keeps fatigue down.
 - **A full weekend off for everyone** keeps it fair.

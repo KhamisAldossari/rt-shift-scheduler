@@ -17,14 +17,17 @@ reports each as **PASS/FAIL** with the measured value.
 - **Any month / year** — day count, start weekday, and Fri/Sat weekends are computed
   from your chosen month.
 - **Exactly 16 shifts per employee** (configurable, but exact — not a range).
-- **Fixed 2-person night team** that works nights only (no day shifts, no circadian
-  flipping).
-- **Smart night coverage** — at least 1 night every day, with a 2nd overlapping night
-  only on the days the math forces it (never a free-for-all).
+- **Two night-coverage models** — a **fixed night team of any size** that works nights only
+  (no day shifts, no circadian flipping), **or** a **full rotation** where every employee is
+  night-eligible and nights are spread across the whole roster.
+- **Smart night coverage** — at least 1 night every day, with overlap above the floor only
+  on the days the math forces it (never a free-for-all).
 - **Fatigue rules** — no Night→Day next-day flip, day runs ≤ 4, night runs ≤ 3,
   off runs 2–4, work runs ≥ 2.
-- **Fairness** — even night split, even Fri/Sat duty per team, and at least one full
-  Fri+Sat weekend off for everyone.
+- **Fairness, four ways** — equal totals, balanced night load, balanced weekends (even
+  Fri/Sat duty + a full weekend off each), and balanced "undesirable runs" (overlaps +
+  max-length streaks) spread so no one absorbs the rough patterns. Each is reported
+  PASS/FAIL **with its measured spread**, and all are tunable.
 - **Independent validator** — every rule re-checked from the grid and shown PASS/FAIL.
 - **Excel output** — a `Schedule` grid sheet + a `Summary`/validation sheet, color-coded.
 - **Browser UI** (Streamlit) — configure everything; no code editing required.
@@ -50,9 +53,9 @@ reports each as **PASS/FAIL** with the measured value.
 .venv/bin/streamlit run app.py
 ```
 
-Your browser opens to the app. Set the month, staff, night team, and rule values in
-the sidebar, click **Generate roster**, review the roster and the PASS/FAIL checks,
-then **Download Excel (.xlsx)**.
+Your browser opens to the app. Set the month, staff, night model, rules, and fairness in
+the sidebar, click **Generate roster**, review the roster, the per-employee fairness
+summary, and the PASS/FAIL checks, then **Download Excel (.xlsx)**.
 
 ### Command line
 
@@ -80,8 +83,9 @@ ScheduleSettings ──▶ preflight() ──▶ build_and_solve() ──▶ val
 2. **`preflight()`** — cheap arithmetic checks that catch an impossible rule set before
    the solver runs, each paired with a concrete suggestion (e.g. *"raise max nights/day
    to 2"*).
-3. **`build_and_solve()`** — the CP-SAT model. Hard rules are constraints; fairness goals
-   are minimized as a weighted objective. Deterministic (fixed seed → same roster each run).
+3. **`build_and_solve()`** — the CP-SAT model. Hard rules are constraints; the four fairness
+   goals are minimized as an equal-weighted objective. Deterministic — fixed seed + a
+   deterministic search budget → the same roster on any machine.
 4. **`validate()`** — re-derives every rule straight from the grid, independent of the
    solver, and returns PASS/FAIL + the measured value.
 5. **`export()` / `export_bytes()`** — the color-coded workbook.
@@ -94,7 +98,8 @@ ScheduleSettings ──▶ preflight() ──▶ build_and_solve() ──▶ val
 |---|---|---|
 | `year`, `month` | 2026, 8 | Calendar month to schedule |
 | `employees` | Employee 1–7 | The staff list (any size) |
-| `night_team` | Employee 6, 7 | The 2 people who work nights |
+| `rotation_mode` | `"fixed_team"` | `"fixed_team"` (dedicated team) or `"rotate"` (everyone) |
+| `night_team` | Employee 6, 7 | Who works nights — **any size** (fixed_team mode) |
 | `night_team_nights_only` | `True` | Night team works nights only |
 | `day_min`, `day_max` | 2, 4 | Day staff required per day |
 | `night_min`, `night_max` | 1, 2 | Night coverage band per day |
@@ -104,15 +109,18 @@ ScheduleSettings ──▶ preflight() ──▶ build_and_solve() ──▶ val
 | `min_consec_work` | 2 | Min consecutive work (must be 2) |
 | `min_consec_off` | 2 | Min consecutive off (must be 2) |
 | `max_consec_off` | 4 | Max consecutive off run |
-| `fairness_max_gap` | 1 | Allowed max−min gap for "even" rules |
 | `weekend_days` | Fri, Sat | The weekend (Saudi convention) |
-| `w_*` weights | — | Objective weights for the soft goals |
+| `fair_tol_total/night/weekend/runs` | 0 / 1 / 1 / 2 | Pass tolerance (max−min ≤) per fairness goal |
+| `w_fair_total/night/weekend/runs` | 100 each | Equal objective weights for the four goals |
+| `solver_det_time_limit` | 24 | Deterministic search budget (reproducible) |
 
-> **Note on exactly-16 + the night team.** Two nights-only members each working exactly
-> 16 means the month always has **32 night-shifts**. Spread over an N-day month at ≥ 1/day,
-> that forces exactly **(32 − N)** double-night days — `1` for a 31-day month, `2` for 30,
-> `3` for 29, `4` for 28 (February). This is the minimum overlap, validated as
-> *"2nd night only where needed."*
+> **Note on exactly-16 + a fixed night team.** A nights-only team of **N** members each
+> working exactly 16 means the month always has **16·N night-shifts**. Spread over a
+> `days`-day month at ≥ `night_min`/day, that forces exactly
+> **max(0, 16·N − night_min·days)** extra "overlap" nights stacked onto some days — the
+> unavoidable minimum, validated as *"Night overlap is minimal."* (For the default 2-person
+> team at `night_min = 1` this is the classic `(32 − days)` double-night days.) In **rotate**
+> mode the night total isn't pinned, so there's no forced overlap.
 
 ---
 
@@ -120,15 +128,18 @@ ScheduleSettings ──▶ preflight() ──▶ build_and_solve() ──▶ val
 
 **Hard** (modeled as CP-SAT constraints, can never be violated):
 exactly-16 shifts · day staffing within `[day_min, day_max]` · night coverage within
-`[night_min, night_max]` (never uncovered) · nights worked only by the night team ·
-night team works nights only · no Night→Day next day · day runs ≤ `max_consec_work` ·
-night runs ≤ `max_consec_night` · work runs ≥ 2 · off runs ≥ 2 and ≤ `max_consec_off`.
+`[night_min, night_max]` (never uncovered) · nights worked only by the night team, and the
+night team works nights only *(fixed-team mode)* · no Night→Day next day · day runs ≤
+`max_consec_work` · night runs ≤ `max_consec_night` · work runs ≥ 2 · off runs ≥ 2 and ≤
+`max_consec_off`.
 
-**Best-effort** (solver objectives, surfaced as PASS/FAIL by the validator):
-even night split across the night team · even Fri/Sat duty within each team · at least
-one full Fri+Sat weekend off for everyone. These PASS for typical months; for an
-unusually tight configuration the validator will show them as FAIL rather than silently
-dropping them.
+**Best-effort fairness** (four equal-weighted soft objectives, surfaced as PASS/FAIL **plus
+the measured spread** by the validator): equal totals · balanced night load across
+night-eligible staff · balanced weekends (even Fri/Sat duty within each pool + a full
+weekend off each) · balanced undesirable runs (overlaps + max-length streaks, balanced
+within each pool). These PASS for typical months; for an unusually tight configuration
+(e.g. a 3-person night team in a 28-day February) the validator shows a goal as FAIL rather
+than silently dropping it — the roster stays valid because every hard rule still holds.
 
 ---
 
@@ -139,8 +150,9 @@ dropping them.
 - **Schedule** — rows = employees, columns = days (`D1 Sun … DN`), each cell is
   `D` (day), `N` (night), or `OFF`, color-coded; trailing Total / Day / Night / Fri-Sat
   columns. Weekends (Fri/Sat) are highlighted in the header.
-- **Summary** — per-employee counts, the night-team split + double-night-day count, and
-  the full rule-validation table (PASS/FAIL + measured).
+- **Summary** — a per-employee fairness summary (Total / Day / Night / Fri-Sat / Rough), the
+  night split + overlap-night-day count, and the full rule-validation table (PASS/FAIL +
+  measured).
 
 ---
 

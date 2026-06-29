@@ -35,11 +35,18 @@ thin front-end over the engine.
 
 - **Exactly-16 is hard** (`sum(work) == shifts_per_employee`). Do not turn it back into a
   range without being asked.
-- **Night team works nights only** (`work == night` for night-team indices) and is the
-  **only** group eligible for nights. Two nights-only members on exactly-16 ⇒ a fixed
-  **32 night-shifts/month** ⇒ exactly **(32 − days)** forced double-night days. The
-  validator checks this as *"2nd night only where needed"* via `expected_double_nights()`.
-  If you change `shifts_per_employee` or the night-team size, that helper and the
+- **Two rotation modes (`rotation_mode`).** *fixed_team* — a night team of **any size N**
+  works nights only (`work == night` for night-team indices) and is the **only** group
+  eligible for nights. *rotate* — no team; **every** employee is night-eligible and nights
+  rotate across the roster, balanced softly (no hard per-person night cap). Role membership
+  is resolved per mode by `night_eligible_indices()` / `day_capable_indices()`; never
+  hard-code who works nights.
+- **Forced night overlap (fixed_team).** N nights-only members on exactly-16 ⇒ a fixed
+  **16·N night-shifts/month** ⇒ forced overlap above the floor =
+  `max(0, 16·N − night_min·days)`. The validator checks this as *"Night overlap is minimal
+  (only forced extra nights)"* via `expected_double_nights()` (it returns the forced
+  surplus; **0** in rotate mode, where the night total isn't pinned). If you change
+  `shifts_per_employee`, the night-team size, or `night_min`, that helper **and** the
   `night_min/night_max` band must stay consistent or the model goes infeasible.
 - **Night coverage is a band `[night_min, night_max]`**, never below `night_min` (a night
   is never uncovered). Default `[1, 2]`.
@@ -49,14 +56,28 @@ thin front-end over the engine.
   `assert min_consec_work == 2 and min_consec_off == 2`. If you ever need a different
   minimum, generalize the neighbour-encoding constraints first; `preflight()` also guards
   this with a `Problem`.
-- **Determinism:** single worker + fixed `random_seed=42`. Keep it so the same inputs give
-  the same roster (resume/reproducibility).
-- **Hard vs soft:** even night split, even Fri/Sat spread, and full-weekend-off-for-all are
-  **soft** (objective weights `w_*`), surfaced as PASS/FAIL by the validator. Exactly-16,
-  coverage bands, the run caps, no-N→D, and nights-only are **hard**. Don't promote a soft
-  goal to hard without checking it doesn't make common months infeasible.
+- **Determinism:** single worker + fixed `random_seed=42` + a **deterministic** time limit
+  (`max_deterministic_time = solver_det_time_limit`). The fairness objective often can't be
+  *proven* optimal in time, and a wall-clock cap would make the roster machine-dependent —
+  the deterministic limit makes the stop point (and the roster) reproducible on any machine,
+  even when the solve ends at `FEASIBLE`. `solver_time_limit` is only a wall-clock safety
+  net, sized so it does **not** bind before the deterministic budget. Don't revert to a
+  wall-clock-only limit.
+- **Hard vs soft:** the **four fairness goals** are **soft** (equal-weighted objective terms
+  `w_fair_*`), each surfaced by the validator as PASS/FAIL **plus the measured spread**
+  against a tunable tolerance (`fair_tol_*`): (1) equal totals, (2) balanced night load,
+  (3) balanced weekends — even Fri/Sat duty + a full weekend off each, (4) balanced
+  undesirable runs — overlap nights + max-length streaks. Goal 4 is balanced **within each
+  pool** (day-capable vs night-eligible): a fixed night team structurally absorbs all
+  overlap, so a cross-pool comparison isn't a fairness signal. Exactly-16, coverage bands,
+  the run caps, no-N→D, and nights-only eligibility are **hard**. Don't promote a soft goal
+  to hard without checking it keeps common months feasible. Some tight months can *provably*
+  soft-fail a goal (e.g. N=3 nights-only February can't give all three a full weekend off) —
+  that's honestly reported; every hard rule still holds.
 - **Two places to update when adding a rule:** the constraint in `build_and_solve()` **and**
   an independent check in `validate()`. A rule that isn't in the validator isn't trusted.
+  For a **fairness** goal, the objective term and the validator check must score the **same
+  quantity** — otherwise the solver can report OPTIMAL while the validator reports FAIL.
 
 ## Weekend convention
 
@@ -81,13 +102,23 @@ for S in [
     sch.ScheduleSettings(year=2027, month=1,                        # 8 staff, alt night pair
         employees=[f"Employee {i}" for i in range(1, 9)],
         night_team=["Employee 1", "Employee 2"]),
+    sch.ScheduleSettings(year=2027, month=3,                        # fixed night team of 3
+        employees=[f"Employee {i}" for i in range(1, 10)],
+        night_team=["Employee 7", "Employee 8", "Employee 9"], night_max=2),
+    sch.ScheduleSettings(year=2026, month=9, rotation_mode=sch.ROTATE),  # everyone rotates
 ]:
     sol = sch.build_and_solve(S)
     res = sch.validate(S, sol.grid)
     assert sol.grid and all(r.passed for r in res), (S.month_label, [r.name for r in res if not r.passed])
 ```
 
-All of the above should solve `OPTIMAL` with every rule `PASS`.
+The four fixed-team cases solve `OPTIMAL`; the rotate case may end at a **reproducible**
+`FEASIBLE` within the deterministic budget — both with every rule `PASS`. (Determinism note:
+a tight month + a larger night team can *provably* soft-fail the weekend goal, e.g. N=3
+nights-only in February — that's a contract-compliant soft FAIL, not a broken smoke test, so
+keep such configs out of the all-PASS assertion.) When you touch fairness goal 4 or the
+solver limits, re-run an **all-12-months** sweep for the default, an N≥3 team, and rotate —
+not just the months above — and confirm grids are identical across re-solves.
 
 ## Conventions
 

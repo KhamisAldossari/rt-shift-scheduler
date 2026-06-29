@@ -18,17 +18,24 @@ nothing about the month, the staff, or the rule values is hard-coded.
 
 POLICY (this revision):
   * Every employee works EXACTLY `shifts_per_employee` shifts for the month.
-  * Nights are covered by a fixed night team that works nights ONLY. To let
-    every night-team member reach the exact target, night coverage is "at least
-    1, at most `night_max`" per day -- a 2nd overlapping night appears only on
-    the days arithmetic forces it, never as a free-for-all, and a night is never
-    left uncovered.
+  * Nights are covered under one of two selectable rotation modes:
+      - "fixed_team": a dedicated night team of ANY size N works nights ONLY and
+        is the only group eligible for nights. Coverage is the band
+        [night_min, night_max]; overlap above the floor appears only on the days
+        the exact arithmetic forces it, never as a free-for-all.
+      - "rotate": there is no dedicated team -- every employee is night-eligible
+        and nights rotate across the whole roster. The night load is balanced as
+        evenly as possible (a soft fairness goal), not pinned to a fixed total.
   * No Night->Day next-calendar-day transition for anyone.
   * Day-shift runs are capped at `max_consec_work`; night runs at
     `max_consec_night`; off runs floored at `min_consec_off`, capped at
     `max_consec_off`; work runs floored at `min_consec_work`.
-  * The solver tries to give every employee >= 1 full Fri+Sat weekend off and to
-    spread Fri/Sat duty evenly within each team.
+  * FAIRNESS is the top priority and is expressed as four soft, equally-weighted
+    objective goals -- equal totals, balanced night load, balanced weekends, and
+    balanced "undesirable runs" (forced overlaps + max-length streaks) -- each of
+    which the independent validator re-derives and reports as PASS/FAIL plus the
+    measured spread (max - min). Fairness goals are SOFT: they never block a
+    solve, and never override a hard rule.
 
 Run:  ./.venv/bin/python scheduler.py
 Out:  schedule.xlsx  (+ a summary printed to stdout)
@@ -51,6 +58,9 @@ from openpyxl.utils import get_column_letter
 # Shift codes used throughout.
 DAY, NIGHT, OFF = "D", "N", "O"
 
+# Rotation modes (how nights are covered).
+FIXED_TEAM, ROTATE = "fixed_team", "rotate"
+
 # Calendar weekday names, indexed Sun..Sat to match the roster header style.
 WEEKDAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
@@ -68,10 +78,15 @@ class ScheduleSettings:
     # --- Staff --------------------------------------------------------------
     employees: list[str] = field(
         default_factory=lambda: [f"Employee {i}" for i in range(1, 8)])
-    # The fixed night team works nights ONLY (no day shifts).
+
+    # --- Night model --------------------------------------------------------
+    # "fixed_team": night_team (ANY size) works nights only and is the only
+    #               group eligible for nights.
+    # "rotate":     no dedicated team -- everyone is night-eligible.
+    rotation_mode: str = FIXED_TEAM
     night_team: list[str] = field(
         default_factory=lambda: ["Employee 6", "Employee 7"])
-    night_team_nights_only: bool = True
+    night_team_nights_only: bool = True             # fixed_team: no day shifts
 
     # --- Staffing bands -----------------------------------------------------
     day_min: int = 2                                # day staff required per day
@@ -90,16 +105,33 @@ class ScheduleSettings:
     max_consec_off: int = 4                         # no long idle block
 
     # --- Fairness -----------------------------------------------------------
-    fairness_max_gap: int = 1
     weekend_days: tuple = ("Fri", "Sat")            # the "weekend" for fairness
 
-    # --- Objective weights (all minimized; lower = better) ------------------
-    w_night_split: int = 100                        # even night split (team)
-    w_workload: int = 80                            # even total workload
-    w_weekend_off: int = 40                         # >=1 full weekend off each
-    w_weekend_split: int = 10                       # even Fri/Sat duty per team
+    # Tolerances: a fairness goal PASSES when its measured spread (max - min)
+    # is within tolerance. Loose by default so common months stay green; tighten
+    # from the UI to demand stricter fairness. Totals are pinned exact (spread 0).
+    fair_tol_total: int = 0
+    fair_tol_night: int = 1
+    fair_tol_weekend: int = 1
+    fair_tol_runs: int = 2
 
-    solver_time_limit: float = 30.0
+    # --- Objective weights (all minimized; equal => the four goals matter
+    #     equally). Raising one weight prioritises that goal in trade-offs. -----
+    w_fair_total: int = 100                         # equal total shifts
+    w_fair_night: int = 100                         # balanced night load
+    w_fair_weekend: int = 100                       # balanced weekends
+    w_fair_runs: int = 100                          # balanced undesirable runs
+
+    # Determinism: the solver is bounded by DETERMINISTIC time (reproducible
+    # work units, machine-independent) so the same inputs always give the same
+    # roster -- even when a hard fairness objective is not proven optimal in
+    # time. Strict reproducibility relies on THIS limit binding first; the
+    # wall-clock `solver_time_limit` is only a safety net, sized so it does not
+    # bind before the deterministic budget on normal hardware. Fixed-team months
+    # solve in well under a second; the larger budget is headroom for the harder
+    # rotate mode, whose soft weekend goal needs more search to converge.
+    solver_det_time_limit: float = 24.0
+    solver_time_limit: float = 180.0
 
     # --- Derived calendar facts --------------------------------------------
     @property
@@ -116,12 +148,19 @@ class ScheduleSettings:
         return f"{calendar.month_name[self.month]} {self.year}"
 
     @property
+    def is_rotate(self) -> bool:
+        return self.rotation_mode == ROTATE
+
+    @property
     def day_team(self) -> list[str]:
+        """Employees who may work day shifts (everyone, in rotate mode)."""
+        if self.is_rotate or not self.night_team_nights_only:
+            return list(self.employees)
         return [e for e in self.employees if e not in self.night_team]
 
 
 # ---------------------------------------------------------------------------
-# CALENDAR HELPERS
+# CALENDAR / ROLE HELPERS
 # ---------------------------------------------------------------------------
 
 def weekday_of(settings: ScheduleSettings, day_index: int) -> str:
@@ -140,17 +179,61 @@ def weekend_pair_indices(settings: ScheduleSettings) -> list[tuple[int, int]]:
             if weekday_of(settings, d) == "Fri" and weekday_of(settings, d + 1) == "Sat"]
 
 
-def expected_double_nights(settings: ScheduleSettings) -> int:
-    """How many days must carry a 2nd overlapping night, given exact totals.
+def night_eligible_indices(settings: ScheduleSettings) -> list[int]:
+    """Employee indices allowed to work nights (everyone, in rotate mode)."""
+    if settings.is_rotate:
+        return list(range(len(settings.employees)))
+    return [settings.employees.index(name) for name in settings.night_team
+            if name in settings.employees]
 
-    With a nights-only team each on `shifts_per_employee`, the month has a fixed
-    number of night-shifts; spread over `days` at >= 1/day, the surplus lands as
-    double-night days. This is the minimum the arithmetic forces -- nothing more.
+
+def day_capable_indices(settings: ScheduleSettings) -> list[int]:
+    """Employee indices allowed to work day shifts.
+
+    In fixed_team + nights-only mode the night team never works days; otherwise
+    (rotate, or a fixed team that may also work days) everyone is day-capable.
     """
-    if not settings.night_team_nights_only:
+    n = len(settings.employees)
+    if not settings.is_rotate and settings.night_team_nights_only:
+        elig = set(night_eligible_indices(settings))
+        return [i for i in range(n) if i not in elig]
+    return list(range(n))
+
+
+def is_night_member(settings: ScheduleSettings, e: int) -> bool:
+    """True iff employee index `e` belongs to a dedicated nights-only team."""
+    return (not settings.is_rotate
+            and settings.employees[e] in settings.night_team)
+
+
+def expected_double_nights(settings: ScheduleSettings) -> int:
+    """Forced night-overlap (extra nights above the floor), given exact totals.
+
+    A nights-only team of ANY size N, each working `shifts_per_employee`, places
+    a fixed N * shifts night-shifts. With >= night_min covered every day, the
+    surplus above the floor -- max(0, total_nights - night_min*days) -- must land
+    as overlap (extra nights stacked onto some days). This is the minimum the
+    arithmetic forces; nothing more. The validator checks the realised overlap
+    equals it. For the default 2-person team on night_min=1 this is the classic
+    "(32 - days) double-night days". In 'rotate' mode the night total is not
+    pinned, so there is no forced overlap and this returns 0.
+    """
+    if settings.is_rotate or not settings.night_team_nights_only:
         return 0
-    total_nights = settings.shifts_per_employee * len(settings.night_team)
-    return max(0, total_nights - settings.days)
+    n_night = len(night_eligible_indices(settings))
+    total_nights = settings.shifts_per_employee * n_night
+    return max(0, total_nights - settings.night_min * settings.days)
+
+
+def roster_caption(settings: ScheduleSettings) -> str:
+    """One-line description of the roster, shared by Excel and the CLI."""
+    S = settings
+    head = f"Roster: {S.month_label} ({S.days} days)."
+    if S.is_rotate:
+        return f"{head} All staff rotate nights."
+    names = ", ".join(S.night_team) if S.night_team else "(none)"
+    only = " (nights only)" if S.night_team_nights_only else ""
+    return f"{head} Night team: {names}{only}."
 
 
 # ---------------------------------------------------------------------------
@@ -173,23 +256,13 @@ def preflight(settings: ScheduleSettings) -> list[Problem]:
     problems: list[Problem] = []
     days = S.days
     n_emp = len(S.employees)
-    n_night = len(S.night_team)
-    n_day = n_emp - n_night
     w = S.shifts_per_employee
 
-    # --- Basic shape --------------------------------------------------------
+    # --- Basic shape (mode-independent) ------------------------------------
     if n_emp == 0:
         problems.append(Problem("No employees configured.",
                                 "Add at least 3-4 employees."))
         return problems
-    if not set(S.night_team).issubset(set(S.employees)):
-        problems.append(Problem(
-            "Night team includes someone who is not in the employee list.",
-            "Choose night-team members from the current employee list."))
-    if n_night < 1:
-        problems.append(Problem(
-            "No night-team members selected.",
-            "Select exactly 2 employees as the night team."))
     if S.min_consec_work != 2 or S.min_consec_off != 2:
         problems.append(Problem(
             "Minimum consecutive work/off must be 2 (the model encodes exactly 2).",
@@ -199,37 +272,13 @@ def preflight(settings: ScheduleSettings) -> list[Problem]:
             f"{w} shifts/employee cannot fit in a {days}-day month.",
             f"Lower shifts/employee to at most {days}, or choose a longer month."))
         return problems
-
-    # --- Night coverage capacity (nights-only team) -------------------------
-    total_nights = w * n_night if S.night_team_nights_only else None
-    if S.night_team_nights_only and n_night >= 1:
-        if total_nights < S.night_min * days:
-            problems.append(Problem(
-                f"Night team supplies {total_nights} nights, but >= {S.night_min}/day "
-                f"needs {S.night_min * days}.",
-                f"Lower min nights/day, or give the night team more shifts."))
-        if total_nights > S.night_max * days:
-            need = _ceil(total_nights, days)
-            problems.append(Problem(
-                f"Night team must place {total_nights} nights, but <= {S.night_max}/day "
-                f"only allows {S.night_max * days}.",
-                f"Raise max nights/day to {need}, or shrink the night-team workload."))
-
-    # --- Day coverage capacity ----------------------------------------------
-    day_shifts = w * n_emp - (total_nights if total_nights is not None else 0)
-    if day_shifts < S.day_min * days:
+    if S.day_min + S.night_min > n_emp:
         problems.append(Problem(
-            f"Only {day_shifts} day-shifts are available, but >= {S.day_min}/day "
-            f"needs {S.day_min * days}.",
-            f"Add day-team staff, or lower min day staffing to {day_shifts // days}."))
-    if day_shifts > S.day_max * days:
-        need = _ceil(day_shifts, days)
-        problems.append(Problem(
-            f"{day_shifts} day-shifts must be placed, but <= {S.day_max}/day only "
-            f"allows {S.day_max * days}.",
-            f"Raise max day staffing to {need}, or remove a day-team member."))
+            f"Each day needs at least {S.day_min} day + {S.night_min} night = "
+            f"{S.day_min + S.night_min} people, but only {n_emp} employees exist.",
+            f"Add staff, or lower the daily minimums to total <= {n_emp}."))
 
-    # --- Per-employee run-length pattern feasibility ------------------------
+    # The run-length pattern check is shared by both modes.
     def pattern_problem(label, work_days, max_work, max_off):
         o = days - work_days
         bw_lo, bw_hi = _ceil(work_days, max_work), work_days // S.min_consec_work
@@ -254,6 +303,68 @@ def preflight(settings: ScheduleSettings) -> list[Problem]:
                 "Widen a run-length cap, or change shifts/employee.")
         return None
 
+    # --- Mode B: everyone rotates nights -----------------------------------
+    if S.is_rotate:
+        total_shifts = w * n_emp
+        floor_need = (S.day_min + S.night_min) * days
+        ceil_cap = (S.day_max + S.night_max) * days
+        if total_shifts < floor_need:
+            problems.append(Problem(
+                f"{total_shifts} total shifts can't cover the daily floor of "
+                f"{S.day_min + S.night_min}/day ({floor_need} needed).",
+                "Add staff, raise shifts/employee, or lower the daily minimums."))
+        if total_shifts > ceil_cap:
+            problems.append(Problem(
+                f"{total_shifts} total shifts exceed the {ceil_cap} the daily maxima "
+                f"allow (<= {S.day_max + S.night_max}/day).",
+                "Raise max day/night staffing, remove staff, or lower shifts/employee."))
+        p = pattern_problem("Roster pattern", w, S.max_consec_work, S.max_consec_off)
+        if p:
+            problems.append(p)
+        return problems
+
+    # --- Mode A: fixed night team ------------------------------------------
+    n_night = len(S.night_team)
+    if not set(S.night_team).issubset(set(S.employees)):
+        problems.append(Problem(
+            "Night team includes someone who is not in the employee list.",
+            "Choose night-team members from the current employee list."))
+    if n_night < 1:
+        problems.append(Problem(
+            "No night-team members selected.",
+            "Select at least 1 employee for the night team (any size)."))
+
+    # Night coverage capacity (nights-only team).
+    total_nights = w * n_night if S.night_team_nights_only else None
+    if S.night_team_nights_only and n_night >= 1:
+        if total_nights < S.night_min * days:
+            problems.append(Problem(
+                f"Night team supplies {total_nights} nights, but >= {S.night_min}/day "
+                f"needs {S.night_min * days}.",
+                f"Lower min nights/day, or give the night team more shifts."))
+        if total_nights > S.night_max * days:
+            need = _ceil(total_nights, days)
+            problems.append(Problem(
+                f"Night team must place {total_nights} nights, but <= {S.night_max}/day "
+                f"only allows {S.night_max * days}.",
+                f"Raise max nights/day to {need}, add a night-team member, or shrink "
+                f"the night-team workload."))
+
+    # Day coverage capacity.
+    day_shifts = w * n_emp - (total_nights if total_nights is not None else 0)
+    if day_shifts < S.day_min * days:
+        problems.append(Problem(
+            f"Only {day_shifts} day-shifts are available, but >= {S.day_min}/day "
+            f"needs {S.day_min * days}.",
+            f"Add day-team staff, or lower min day staffing to {day_shifts // days}."))
+    if day_shifts > S.day_max * days:
+        need = _ceil(day_shifts, days)
+        problems.append(Problem(
+            f"{day_shifts} day-shifts must be placed, but <= {S.day_max}/day only "
+            f"allows {S.day_max * days}.",
+            f"Raise max day staffing to {need}, or remove a day-team member."))
+
+    # Per-employee run-length pattern feasibility.
     p = pattern_problem("Day-team pattern", w, S.max_consec_work, S.max_consec_off)
     if p:
         problems.append(p)
@@ -293,10 +404,10 @@ def build_and_solve(settings: ScheduleSettings) -> Solution:
     S = settings
     days = S.days
     n = len(S.employees)
-    eligible_idx = [S.employees.index(name) for name in S.night_team
-                    if name in S.employees]
-    night_team_idx = set(eligible_idx)
-    day_team_idx = [i for i in range(n) if i not in night_team_idx]
+    elig = night_eligible_indices(S)            # may work nights
+    elig_set = set(elig)
+    day_cap = day_capable_indices(S)            # may work day shifts
+    day_cap_set = set(day_cap)
     weekend_days = weekend_day_indices(S)
     weekend_pairs = weekend_pair_indices(S)
 
@@ -311,15 +422,15 @@ def build_and_solve(settings: ScheduleSettings) -> Solution:
         for d in range(days):
             model.Add(night[(e, d)] <= work[(e, d)])
 
-    # Only the night team may work nights.
+    # Only night-eligible staff may work nights (rotate mode => everyone).
     for e in range(n):
-        if e not in night_team_idx:
+        if e not in elig_set:
             for d in range(days):
                 model.Add(night[(e, d)] == 0)
 
-    # Night team works nights ONLY (every working day is a night).
-    if S.night_team_nights_only:
-        for e in night_team_idx:
+    # Fixed nights-only team: every working day is a night.
+    if not S.is_rotate and S.night_team_nights_only:
+        for e in elig_set:
             for d in range(days):
                 model.Add(work[(e, d)] == night[(e, d)])
 
@@ -327,16 +438,19 @@ def build_and_solve(settings: ScheduleSettings) -> Solution:
     for e in range(n):
         model.Add(sum(work[(e, d)] for d in range(days)) == S.shifts_per_employee)
 
-    # Daily staffing bands. Night coverage is a band [night_min, night_max]: a
-    # 2nd night appears only where the exact totals force it (see below), never
-    # below night_min (a night is never uncovered).
+    # Daily staffing bands. Night coverage is a band [night_min, night_max]:
+    # overlap above the floor appears only where the exact totals force it (in
+    # fixed_team mode), never below night_min (a night is never uncovered).
+    night_count = {}
     for d in range(days):
         day_count = sum(work[(e, d)] - night[(e, d)] for e in range(n))
         model.Add(day_count >= S.day_min)
         model.Add(day_count <= S.day_max)
-        night_count = sum(night[(e, d)] for e in range(n))
-        model.Add(night_count >= S.night_min)
-        model.Add(night_count <= S.night_max)
+        ncv = model.NewIntVar(0, n, f"nightcount_{d}")
+        model.Add(ncv == sum(night[(e, d)] for e in range(n)))
+        model.Add(ncv >= S.night_min)
+        model.Add(ncv <= S.night_max)
+        night_count[d] = ncv
 
     # No Night -> Day the next calendar day (post-night recovery).
     for e in range(n):
@@ -350,11 +464,11 @@ def build_and_solve(settings: ScheduleSettings) -> Solution:
     for e in range(n):
         w = [work[(e, d)] for d in range(days)]
 
-        # Max consecutive WORKING days (day-shift run cap for the day team).
+        # Max consecutive WORKING days (day-shift / working run cap).
         for start in range(days - S.max_consec_work):
             model.Add(sum(w[start:start + S.max_consec_work + 1]) <= S.max_consec_work)
 
-        # Max consecutive NIGHTS (priority cap; binds the night team to <= 3).
+        # Max consecutive NIGHTS (priority cap; binds night workers to <= 3).
         for start in range(days - S.max_consec_night):
             model.Add(sum(night[(e, d)] for d in range(start, start + S.max_consec_night + 1))
                       <= S.max_consec_night)
@@ -375,32 +489,33 @@ def build_and_solve(settings: ScheduleSettings) -> Solution:
         for d in range(1, days - 1):
             model.Add(w[d - 1] + w[d + 1] - w[d] <= 1)
 
-    # ---- Soft objectives -------------------------------------------------
+    # ---- Soft fairness objectives (four equally-weighted goals) ----------
+    # Each goal minimises a spread (max - min) so the burden lands evenly. They
+    # are SOFT: they shape the chosen roster but never make a feasible rule set
+    # infeasible. The validator re-derives each from the finished grid.
 
-    def minmax_gap(values, hi_name, lo_name, ub):
-        hi = model.NewIntVar(0, ub, hi_name)
-        lo = model.NewIntVar(0, ub, lo_name)
+    def minmax_gap(values, name, ub):
+        hi = model.NewIntVar(0, ub, name + "_hi")
+        lo = model.NewIntVar(0, ub, name + "_lo")
         for c in values:
             model.Add(hi >= c)
             model.Add(lo <= c)
         return hi - lo
 
-    # (a) Even night split across the night team.
-    night_counts = [sum(night[(e, d)] for d in range(days)) for e in eligible_idx] or [0]
-    night_split_gap = minmax_gap(night_counts, "night_hi", "night_lo", days)
-
-    # (b) Even total workload (already pinned to exact, but kept for robustness).
+    # Goal 1: equal total shifts (already pinned exact; kept for robustness).
     totals = [sum(work[(e, d)] for d in range(days)) for e in range(n)]
-    workload_gap = minmax_gap(totals, "tot_hi", "tot_lo", days)
+    gap_total = minmax_gap(totals, "tot", days)
 
-    # (c) Even Fri/Sat duty within each team.
+    # Goal 2: balanced night load across night-eligible staff.
+    night_per_emp = [sum(night[(e, d)] for d in range(days)) for e in elig] or [0]
+    gap_night = minmax_gap(night_per_emp, "night", days)
+
+    # Goal 3: balanced weekends -- even Fri/Sat duty within each pool, plus a
+    # full Fri+Sat weekend off for everyone (best effort).
     wknd = max(1, len(weekend_days))
-    day_wknd = [sum(work[(e, d)] - night[(e, d)] for d in weekend_days) for e in day_team_idx] or [0]
-    night_wknd = [sum(night[(e, d)] for d in weekend_days) for e in eligible_idx] or [0]
-    wknd_day_gap = minmax_gap(day_wknd, "wkday_hi", "wkday_lo", wknd)
-    wknd_night_gap = minmax_gap(night_wknd, "wknight_hi", "wknight_lo", wknd)
-
-    # (d) Every employee gets >= 1 full Fri+Sat weekend off (best effort).
+    wknd_day = [sum(work[(e, d)] - night[(e, d)] for d in weekend_days) for e in day_cap] or [0]
+    wknd_night = [sum(night[(e, d)] for d in weekend_days) for e in elig] or [0]
+    gap_wknd = minmax_gap(wknd_day, "wkday", wknd) + minmax_gap(wknd_night, "wknight", wknd)
     has_full_off = []
     for e in range(n):
         bits = []
@@ -416,15 +531,63 @@ def build_and_solve(settings: ScheduleSettings) -> Solution:
             model.Add(h == 0)
         has_full_off.append(h)
     num_no_full_off = n - sum(has_full_off)
+    weekend_term = gap_wknd + num_no_full_off
+
+    # Goal 4: balanced "undesirable runs", spread evenly *within* each pool (a
+    # fixed night team structurally carries all overlap, so a cross-pool
+    # comparison is not a fairness signal -- mirror the weekend goal). Rough load
+    # per person = overlap nights worked + count of max-length day runs + count
+    # of max-length night runs. This is the EXACT quantity validate() re-derives
+    # from the grid, so optimising it actually moves the validated metric (a run
+    # that hits the cap can only be length == cap, so one window == one run).
+    overlap = {}
+    for d in range(days):
+        b = model.NewBoolVar(f"overlap_{d}")          # a stacked night above floor
+        model.Add(night_count[d] >= S.night_min + 1).OnlyEnforceIf(b)
+        model.Add(night_count[d] <= S.night_min).OnlyEnforceIf(b.Not())
+        overlap[d] = b
+
+    Lw, Ln = S.max_consec_work, S.max_consec_night
+    rough_terms = [0] * n
+    for e in range(n):
+        parts = []
+        if e in elig_set:                              # overlap nights worked
+            for d in range(days):
+                ov = model.NewBoolVar(f"ovn_{e}_{d}")
+                model.Add(ov <= night[(e, d)])
+                model.Add(ov <= overlap[d])
+                model.Add(ov >= night[(e, d)] + overlap[d] - 1)
+                parts.append(ov)
+        if e in day_cap_set:                           # max-length day runs
+            for start in range(days - Lw + 1):
+                seg = [work[(e, d)] - night[(e, d)] for d in range(start, start + Lw)]
+                wmax = model.NewBoolVar(f"wmax_{e}_{start}")
+                model.Add(sum(seg) >= Lw).OnlyEnforceIf(wmax)
+                model.Add(sum(seg) <= Lw - 1).OnlyEnforceIf(wmax.Not())
+                parts.append(wmax)
+        if e in elig_set:                              # max-length night runs
+            for start in range(days - Ln + 1):
+                seg = [night[(e, d)] for d in range(start, start + Ln)]
+                nmax = model.NewBoolVar(f"nmax_{e}_{start}")
+                model.Add(sum(seg) >= Ln).OnlyEnforceIf(nmax)
+                model.Add(sum(seg) <= Ln - 1).OnlyEnforceIf(nmax.Not())
+                parts.append(nmax)
+        rough_terms[e] = sum(parts) if parts else 0
+    # Sum the per-pool spreads -- an upper bound on the max-pool spread the
+    # validator checks, so minimising it drives the validated metric down.
+    pools = [elig] + ([day_cap] if set(day_cap) != elig_set else [])
+    gap_runs = sum(minmax_gap([rough_terms[e] for e in pool] or [0], f"rough{k}", 2 * days)
+                   for k, pool in enumerate(pools))
 
     model.Minimize(
-        S.w_night_split * night_split_gap
-        + S.w_workload * workload_gap
-        + S.w_weekend_off * num_no_full_off
-        + S.w_weekend_split * (wknd_day_gap + wknd_night_gap)
+        S.w_fair_total * gap_total
+        + S.w_fair_night * gap_night
+        + S.w_fair_weekend * weekend_term
+        + S.w_fair_runs * gap_runs
     )
 
     solver = cp_model.CpSolver()
+    solver.parameters.max_deterministic_time = S.solver_det_time_limit
     solver.parameters.max_time_in_seconds = S.solver_time_limit
     solver.parameters.num_search_workers = 1
     solver.parameters.random_seed = 42
@@ -472,12 +635,48 @@ def _runs(seq: list[bool]) -> list[int]:
     return lengths
 
 
+def employee_loads(settings: ScheduleSettings, grid: list[list[str]]) -> list[dict]:
+    """Per-employee fairness facts, re-derived from the grid (used by the UI,
+    the Excel summary, and the fairness validator so they all agree)."""
+    S = settings
+    days = S.days
+    weekend_days = weekend_day_indices(S)
+    weekend_pairs = weekend_pair_indices(S)
+    night_counts = [sum(1 for e in range(len(S.employees)) if grid[e][d] == NIGHT)
+                    for d in range(days)]
+    loads = []
+    for e in range(len(S.employees)):
+        row = grid[e]
+        day_runs = _runs([row[d] == DAY for d in range(days)])
+        night_runs = _runs([row[d] == NIGHT for d in range(days)])
+        overlaps = sum(1 for d in range(days)
+                       if row[d] == NIGHT and night_counts[d] >= S.night_min + 1)
+        max_runs = (sum(1 for r in day_runs if r >= S.max_consec_work)
+                    + sum(1 for r in night_runs if r >= S.max_consec_night))
+        loads.append({
+            "name": S.employees[e],
+            "night_member": is_night_member(S, e),
+            "total": sum(1 for d in range(days) if row[d] != OFF),
+            "day": sum(1 for d in range(days) if row[d] == DAY),
+            "night": sum(1 for d in range(days) if row[d] == NIGHT),
+            "weekend": sum(1 for d in weekend_days if row[d] != OFF),
+            "overlaps": overlaps,
+            "max_runs": max_runs,
+            "rough": overlaps + max_runs,
+            "weekends_off": sum(1 for (f, s) in weekend_pairs
+                                if row[f] == OFF and row[s] == OFF),
+        })
+    return loads
+
+
 def validate(settings: ScheduleSettings, grid: list[list[str]]) -> list[RuleResult]:
     S = settings
     days = S.days
     n = len(S.employees)
-    night_team_idx = {S.employees.index(x) for x in S.night_team if x in S.employees}
-    day_team_idx = {i for i in range(n) if i not in night_team_idx}
+    rotate = S.is_rotate
+    elig = night_eligible_indices(S)
+    elig_set = set(elig)
+    day_cap = day_capable_indices(S)
     weekend_days = weekend_day_indices(S)
     weekend_pairs = weekend_pair_indices(S)
     results: list[RuleResult] = []
@@ -485,6 +684,7 @@ def validate(settings: ScheduleSettings, grid: list[list[str]]) -> list[RuleResu
     day_counts = [sum(1 for e in range(n) if grid[e][d] == DAY) for d in range(days)]
     night_counts = [sum(1 for e in range(n) if grid[e][d] == NIGHT) for d in range(days)]
 
+    # ===================== HARD RULES =====================================
     results.append(RuleResult(
         f"Day staffing per day within [{S.day_min}, {S.day_max}]",
         all(S.day_min <= c <= S.day_max for c in day_counts),
@@ -494,12 +694,14 @@ def validate(settings: ScheduleSettings, grid: list[list[str]]) -> list[RuleResu
         all(S.night_min <= c <= S.night_max for c in night_counts),
         f"min={min(night_counts)}, max={max(night_counts)}"))
 
-    expected_doubles = expected_double_nights(S)
-    actual_doubles = sum(1 for c in night_counts if c >= 2)
-    results.append(RuleResult(
-        "2nd night only where needed (overlap is minimal)",
-        actual_doubles == expected_doubles,
-        f"double-night days={actual_doubles} (forced minimum={expected_doubles})"))
+    # Forced-overlap minimality only has a fixed target with a nights-only team.
+    if not rotate and S.night_team_nights_only:
+        expected = expected_double_nights(S)
+        actual = sum(max(0, c - S.night_min) for c in night_counts)
+        results.append(RuleResult(
+            "Night overlap is minimal (only forced extra nights)",
+            actual == expected,
+            f"overlap-nights above floor={actual} (forced minimum={expected})"))
 
     results.append(RuleResult(
         "At most one shift per employee per day",
@@ -514,29 +716,33 @@ def validate(settings: ScheduleSettings, grid: list[list[str]]) -> list[RuleResu
 
     night_workers = {S.employees[e] for e in range(n)
                      if any(grid[e][d] == NIGHT for d in range(days))}
-    results.append(RuleResult(
-        "Only the night team works nights",
-        night_workers.issubset(set(S.night_team)),
-        f"night workers={sorted(night_workers)}"))
-    results.append(RuleResult(
-        f"Exactly {len(S.night_team)} people carry nights for the month",
-        len(night_workers) == len(S.night_team),
-        f"{len(night_workers)} have >=1 night: {sorted(night_workers)}"))
-
-    nightteam_dayshifts = [S.employees[e] for e in night_team_idx
-                           if any(grid[e][d] == DAY for d in range(days))]
-    results.append(RuleResult(
-        "Night team works nights only (no day shifts)",
-        not nightteam_dayshifts,
-        "0 day shifts by night team" if not nightteam_dayshifts else f"violations: {nightteam_dayshifts}"))
-
-    night_by_emp = {S.employees[e]: sum(1 for d in range(days) if grid[e][d] == NIGHT)
-                    for e in sorted(night_team_idx)}
-    nvals = list(night_by_emp.values()) or [0]
-    results.append(RuleResult(
-        f"Nights split evenly across the night team (gap <= {S.fairness_max_gap})",
-        (max(nvals) - min(nvals)) <= S.fairness_max_gap and min(nvals) >= 1,
-        f"{night_by_emp} -> gap={max(nvals) - min(nvals)}"))
+    if rotate:
+        # No dedicated team: nights may land on anyone -- just confirm that.
+        results.append(RuleResult(
+            "All staff are night-eligible (rotation)",
+            night_workers.issubset(set(S.employees)),
+            f"{len(night_workers)} of {n} staff worked >=1 night"))
+    else:
+        results.append(RuleResult(
+            "Only the night team works nights",
+            night_workers.issubset(set(S.night_team)),
+            f"night workers={sorted(night_workers)}"))
+        if S.night_team_nights_only:
+            # With a nights-only team, every member works only nights, so all of
+            # them necessarily carry >=1 night. (If the team could also work days
+            # a member legitimately taking zero nights must NOT count as a fault,
+            # so this check only applies in the nights-only case.)
+            results.append(RuleResult(
+                f"Exactly {len(S.night_team)} people carry nights for the month",
+                len(night_workers) == len(S.night_team),
+                f"{len(night_workers)} have >=1 night: {sorted(night_workers)}"))
+            nightteam_dayshifts = [S.employees[e] for e in elig_set
+                                   if any(grid[e][d] == DAY for d in range(days))]
+            results.append(RuleResult(
+                "Night team works nights only (no day shifts)",
+                not nightteam_dayshifts,
+                "0 day shifts by night team" if not nightteam_dayshifts
+                else f"violations: {nightteam_dayshifts}"))
 
     nd = [(S.employees[e], f"D{d + 1}->D{d + 2}") for e in range(n)
           for d in range(days - 1) if grid[e][d] == NIGHT and grid[e][d + 1] == DAY]
@@ -580,27 +786,52 @@ def validate(settings: ScheduleSettings, grid: list[list[str]]) -> list[RuleResu
         max_off_run <= S.max_consec_off,
         f"longest off streak={max_off_run}"))
 
-    day_wknd = [sum(1 for d in weekend_days if grid[e][d] == DAY) for e in sorted(day_team_idx)] or [0]
-    results.append(RuleResult(
-        f"Fri/Sat day shifts spread evenly across the day team (gap <= {S.fairness_max_gap})",
-        (max(day_wknd) - min(day_wknd)) <= S.fairness_max_gap,
-        f"counts={day_wknd} -> gap={max(day_wknd) - min(day_wknd)}"))
+    # ===================== FAIRNESS (4 soft goals) ========================
+    # Each reports PASS/FAIL against a tunable tolerance, plus the spread.
+    loads = employee_loads(S, grid)
 
-    night_wknd = [sum(1 for d in weekend_days if grid[e][d] == NIGHT) for e in sorted(night_team_idx)] or [0]
-    results.append(RuleResult(
-        f"Fri/Sat nights spread evenly across the night team (gap <= {S.fairness_max_gap})",
-        (max(night_wknd) - min(night_wknd)) <= S.fairness_max_gap,
-        f"counts={night_wknd} -> gap={max(night_wknd) - min(night_wknd)}"))
+    def spread(values):
+        vals = list(values) or [0]
+        return max(vals) - min(vals)
 
-    if weekend_pairs:
-        full_off = {S.employees[e]: sum(1 for (f, s) in weekend_pairs
-                                        if grid[e][f] == OFF and grid[e][s] == OFF)
-                    for e in range(n)}
-        no_off = [name for name, c in full_off.items() if c == 0]
-        results.append(RuleResult(
-            "Every employee gets >= 1 full Fri+Sat weekend off",
-            not no_off,
-            "all have >=1" if not no_off else f"none for: {no_off}"))
+    # F1 -- equal total shifts.
+    sp_total = spread(ld["total"] for ld in loads)
+    results.append(RuleResult(
+        f"Fairness - equal total shifts (spread <= {S.fair_tol_total})",
+        sp_total <= S.fair_tol_total,
+        f"spread={sp_total} (every total = {S.shifts_per_employee})"))
+
+    # F2 -- balanced night load across night-eligible staff.
+    night_by = {loads[e]["name"]: loads[e]["night"] for e in elig}
+    sp_night = spread(night_by.values())
+    results.append(RuleResult(
+        f"Fairness - balanced night load (spread <= {S.fair_tol_night})",
+        sp_night <= S.fair_tol_night,
+        f"spread={sp_night}  nights/eligible={night_by}"))
+
+    # F3 -- balanced weekends: even Fri/Sat duty in each pool + a weekend off each.
+    sp_wknd_day = spread(sum(1 for d in weekend_days if grid[e][d] == DAY) for e in day_cap)
+    sp_wknd_night = spread(sum(1 for d in weekend_days if grid[e][d] == NIGHT) for e in elig)
+    no_weekend_off = [loads[e]["name"] for e in range(n)
+                      if weekend_pairs and loads[e]["weekends_off"] == 0]
+    passed_wknd = (max(sp_wknd_day, sp_wknd_night) <= S.fair_tol_weekend
+                   and not no_weekend_off)
+    results.append(RuleResult(
+        f"Fairness - balanced weekends (spread <= {S.fair_tol_weekend}, a weekend off each)",
+        passed_wknd,
+        f"day spread={sp_wknd_day}, night spread={sp_wknd_night}, "
+        f"no weekend-off for: {no_weekend_off or 'none'}"))
+
+    # F4 -- balanced undesirable runs *within* each pool (a fixed night team
+    # structurally carries all overlap; comparing it to the day team is not a
+    # fairness signal -- balance is what matters inside each group).
+    rough_by = {ld["name"]: ld["rough"] for ld in loads}
+    pools = [elig] + ([day_cap] if set(day_cap) != elig_set else [])
+    sp_rough = max((spread(loads[e]["rough"] for e in pool) for pool in pools), default=0)
+    results.append(RuleResult(
+        f"Fairness - balanced undesirable runs (within-pool spread <= {S.fair_tol_runs})",
+        sp_rough <= S.fair_tol_runs,
+        f"within-pool spread={sp_rough}  rough-load(overlap+max-runs)={rough_by}"))
 
     return results
 
@@ -681,8 +912,7 @@ def _write_roster(settings: ScheduleSettings, ws, grid: list[list[str]]) -> None
         _style(ws.cell(1, 2 + days + j), label, FILL_HEADER, FONT_HEADER)
 
     for e in range(len(S.employees)):
-        is_night = S.employees[e] in S.night_team
-        label = S.employees[e] + ("  (night team)" if is_night else "")
+        label = S.employees[e] + ("  (night team)" if is_night_member(S, e) else "")
         _style(ws.cell(2 + e, 1), label, font=FONT_BOLD,
                align=Alignment(horizontal="left", vertical="center"))
         for d in range(days):
@@ -701,9 +931,7 @@ def _write_roster(settings: ScheduleSettings, ws, grid: list[list[str]]) -> None
         _style(ws.cell(legend_row, 2 + j * 2), CELL_LABEL[code], CELL_FILL[code])
         _style(ws.cell(legend_row, 3 + j * 2), text, border=False,
                align=Alignment(horizontal="left", vertical="center"))
-    night_names = ", ".join(S.night_team) if S.night_team else "(none)"
-    _style(ws.cell(legend_row + 1, 1),
-           f"Roster: {S.month_label} ({days} days). Night team: {night_names} (nights only).",
+    _style(ws.cell(legend_row + 1, 1), roster_caption(S),
            font=FONT_BOLD, border=False, align=Alignment(horizontal="left", vertical="center"))
 
     ws.column_dimensions["A"].width = 18
@@ -719,36 +947,32 @@ def _write_summary(settings: ScheduleSettings, ws, grid: list[list[str]],
                    results: list[RuleResult]) -> None:
     S = settings
     days = S.days
-    night_team_idx = {S.employees.index(x) for x in S.night_team if x in S.employees}
-    weekend_days = weekend_day_indices(S)
+    elig = night_eligible_indices(S)
+    loads = employee_loads(S, grid)
     row = 1
 
     def header(text):
         nonlocal row
         _style(ws.cell(row, 1), text, FILL_HEADER, FONT_HEADER,
                align=Alignment(horizontal="left", vertical="center"))
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
         row += 1
 
-    header(f"Per-employee shift counts - {S.month_label}")
-    for j, h in enumerate(["Employee", "Total", "Day", "Night", "Fri/Sat"]):
+    header(f"Per-employee fairness summary - {S.month_label}")
+    for j, h in enumerate(["Employee", "Total", "Day", "Night", "Fri/Sat", "Rough"]):
         _style(ws.cell(row, 1 + j), h, FILL_HEADER, FONT_HEADER)
     row += 1
-    for e in range(len(S.employees)):
-        total = sum(1 for d in range(days) if grid[e][d] != OFF)
-        day_n = sum(1 for d in range(days) if grid[e][d] == DAY)
-        night_n = sum(1 for d in range(days) if grid[e][d] == NIGHT)
-        wknd_n = sum(1 for d in weekend_days if grid[e][d] != OFF)
-        name = S.employees[e] + ("  (night team)" if S.employees[e] in S.night_team else "")
-        for j, val in enumerate([name, total, day_n, night_n, wknd_n]):
+    for e, ld in enumerate(loads):
+        name = ld["name"] + ("  (night team)" if ld["night_member"] else "")
+        cells = [name, ld["total"], ld["day"], ld["night"], ld["weekend"], ld["rough"]]
+        for j, val in enumerate(cells):
             _style(ws.cell(row, 1 + j), val,
                    align=Alignment(horizontal="left" if j == 0 else "center", vertical="center"))
         row += 1
     row += 1
 
-    header("Night coverage - night team")
-    split = {S.employees[e]: sum(1 for d in range(days) if grid[e][d] == NIGHT)
-             for e in sorted(night_team_idx)}
+    header("Night coverage")
+    split = {loads[e]["name"]: loads[e]["night"] for e in elig}
     for name, nval in split.items():
         _style(ws.cell(row, 1), name, align=Alignment(horizontal="left", vertical="center"))
         _style(ws.cell(row, 2), f"{nval} nights")
@@ -757,29 +981,30 @@ def _write_summary(settings: ScheduleSettings, ws, grid: list[list[str]],
         _style(ws.cell(row, 1), "Gap", font=FONT_BOLD, align=Alignment(horizontal="left", vertical="center"))
         _style(ws.cell(row, 2), max(split.values()) - min(split.values()), font=FONT_BOLD)
         row += 1
-    _style(ws.cell(row, 1), "Double-night days",
+    overlap_days = sum(1 for d in range(days)
+                       if sum(1 for e in range(len(S.employees)) if grid[e][d] == NIGHT)
+                       >= S.night_min + 1)
+    _style(ws.cell(row, 1), "Overlap-night days",
            font=FONT_BOLD, align=Alignment(horizontal="left", vertical="center"))
-    _style(ws.cell(row, 2), sum(1 for d in range(days)
-                                if sum(1 for e in range(len(S.employees)) if grid[e][d] == NIGHT) >= 2),
-           font=FONT_BOLD)
+    _style(ws.cell(row, 2), overlap_days, font=FONT_BOLD)
     row += 2
 
     header("Rule validation")
     for j, h in enumerate(["Rule", "Result", "Measured"]):
         _style(ws.cell(row, 1 + j), h, FILL_HEADER, FONT_HEADER)
-    ws.merge_cells(start_row=row, start_column=3, end_row=row, end_column=5)
+    ws.merge_cells(start_row=row, start_column=3, end_row=row, end_column=6)
     row += 1
     for r in results:
         _style(ws.cell(row, 1), r.name, align=Alignment(horizontal="left", vertical="center"))
         _style(ws.cell(row, 2), "PASS" if r.passed else "FAIL",
                FILL_PASS if r.passed else FILL_FAIL, FONT_BOLD)
         _style(ws.cell(row, 3), r.measured, align=Alignment(horizontal="left", vertical="center"))
-        ws.merge_cells(start_row=row, start_column=3, end_row=row, end_column=5)
+        ws.merge_cells(start_row=row, start_column=3, end_row=row, end_column=6)
         row += 1
 
     ws.column_dimensions["A"].width = 52
-    for col in ("B", "C", "D", "E"):
-        ws.column_dimensions[col].width = 16
+    for col in ("B", "C", "D", "E", "F"):
+        ws.column_dimensions[col].width = 14
 
 
 # ---------------------------------------------------------------------------
@@ -789,25 +1014,20 @@ def _write_summary(settings: ScheduleSettings, ws, grid: list[list[str]],
 def print_summary(settings: ScheduleSettings, grid: list[list[str]],
                   results: list[RuleResult]) -> bool:
     S = settings
-    days = S.days
-    night_team_idx = {S.employees.index(x) for x in S.night_team if x in S.employees}
-    night_names = ", ".join(S.night_team) if S.night_team else "(none)"
-    print(f"\nRoster: {S.month_label} ({days} days). Night team: {night_names} (nights only).")
+    loads = employee_loads(S, grid)
+    print(f"\n{roster_caption(S)}")
     print("\nPer-employee counts:")
-    print(f"  {'Employee':<12} {'Total':>5} {'Day':>4} {'Night':>6} {'Fri/Sat':>8}")
-    for e in range(len(S.employees)):
-        total = sum(1 for d in range(days) if grid[e][d] != OFF)
-        day_n = sum(1 for d in range(days) if grid[e][d] == DAY)
-        night_n = sum(1 for d in range(days) if grid[e][d] == NIGHT)
-        wknd_n = sum(1 for d in weekend_day_indices(S) if grid[e][d] != OFF)
-        tag = "  <- night team" if e in night_team_idx else ""
-        print(f"  {S.employees[e]:<12} {total:>5} {day_n:>4} {night_n:>6} {wknd_n:>8}{tag}")
+    print(f"  {'Employee':<12} {'Total':>5} {'Day':>4} {'Night':>6} {'Fri/Sat':>8} {'Rough':>6}")
+    for ld in loads:
+        tag = "  <- night team" if ld["night_member"] else ""
+        print(f"  {ld['name']:<12} {ld['total']:>5} {ld['day']:>4} {ld['night']:>6} "
+              f"{ld['weekend']:>8} {ld['rough']:>6}{tag}")
 
     print("\nRule validation:")
     all_pass = True
     for r in results:
         all_pass &= r.passed
-        print(f"  [{'PASS' if r.passed else 'FAIL'}] {r.name:<55} | {r.measured}")
+        print(f"  [{'PASS' if r.passed else 'FAIL'}] {r.name:<58} | {r.measured}")
     return all_pass
 
 
