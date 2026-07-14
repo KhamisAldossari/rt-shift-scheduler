@@ -9,10 +9,10 @@ and PASS/FAIL on screen comes straight from a scheduler function/field
 (preflight -> build_and_solve -> validate -> export_bytes).
 
 Layout
-  Sidebar : configuration only -- month, staff, night model, staffing bands,
-            rules, and fairness (everything that builds ScheduleSettings). The
-            rarely-touched objective weights and solver budget live in expanders,
-            with one primary "Generate roster" button.
+  Sidebar : configuration only -- month, staff, night team, staffing bands, and
+            rules (everything that builds ScheduleSettings). The rarely-touched
+            solver budget lives in an expander, with one primary "Generate
+            roster" button.
   Main    : results, with the color-coded grid as the visual hero --
               * a month header + compact metrics + a subtle solver status,
               * a positive, next-step status banner (3-way: success / info / error),
@@ -115,29 +115,15 @@ with st.sidebar:
             "Employee", width="large", help="One row per person.")})
     employees = [str(x).strip() for x in emp_df["Employee"].tolist() if str(x).strip()]
 
-    st.subheader("3 · Night coverage")
-    mode_label = st.radio(
-        "How are nights covered?",
-        ["Fixed night team (nights only)", "Everyone rotates nights"],
-        help="Fixed: a dedicated team of any size works nights only and is the only "
-             "group eligible for nights. Rotate: all staff are night-eligible and "
-             "nights are spread across the whole roster.")
-    rotation_mode = sch.FIXED_TEAM if mode_label.startswith("Fixed") else sch.ROTATE
-
-    # The night-team picker only appears for a fixed team (preserve the
-    # conditional and the "pick at least one" warning exactly).
-    if rotation_mode == sch.FIXED_TEAM:
-        night_team = st.multiselect(
-            "Night team (any size ≥ 1 — they work nights only)",
-            options=employees,
-            default=[e for e in defaults.night_team if e in employees])
-        if not night_team:
-            st.warning("Pick at least one night-team member.")
-        else:
-            st.caption(f"{len(night_team)} night-team member(s) selected.")
+    st.subheader("3 · Night team")
+    night_team = st.multiselect(
+        "Night team (any size ≥ 1 — they work nights only)",
+        options=employees,
+        default=[e for e in defaults.night_team if e in employees])
+    if not night_team:
+        st.warning("Pick at least one night-team member.")
     else:
-        night_team = []
-        st.caption("All staff are night-eligible; nights rotate across everyone.")
+        st.caption(f"{len(night_team)} night-team member(s) selected.")
 
     st.subheader("4 · Staffing per day")
     c1, c2 = st.columns(2)
@@ -168,26 +154,13 @@ with st.sidebar:
              "is fully off. A HARD rule (not a soft fairness goal); it can make very "
              "tight months infeasible, in which case turn it off and re-generate.")
 
-    st.subheader("6 · Fairness")
-    st.caption("All four fairness goals are soft. A goal PASSES when its spread "
-               "(max − min) is within tolerance.")
-    c9, c10 = st.columns(2)
-    tol_nw = c9.number_input("Night/weekend tolerance", 0, 10, defaults.fair_tol_night)
-    tol_runs = c10.number_input("Runs tolerance", 0, 10, defaults.fair_tol_runs)
-
-    with st.expander("Objective weights (equal ⇒ goals matter equally)"):
-        w_total = st.number_input("Equal total shifts", 0, 1000, defaults.w_fair_total, step=10)
-        w_night = st.number_input("Balanced night load", 0, 1000, defaults.w_fair_night, step=10)
-        w_weekend = st.number_input("Balanced weekends", 0, 1000, defaults.w_fair_weekend, step=10)
-        w_runs = st.number_input("Balanced undesirable runs", 0, 1000, defaults.w_fair_runs, step=10)
-
     with st.expander("Advanced · solver budget"):
         det_budget = st.number_input(
             "Solver budget (deterministic units)", 4.0, 240.0,
             float(defaults.solver_det_time_limit), step=4.0,
-            help="Higher = more search = better fairness convergence on hard months "
-                 "(especially rotate mode), at the cost of solve time. The budget is "
-                 "deterministic, so the roster is reproducible regardless of machine speed.")
+            help="Higher = more search = better fairness convergence on hard months, "
+                 "at the cost of solve time. The budget is deterministic, so the "
+                 "roster is reproducible regardless of machine speed.")
 
     st.divider()
     generate = st.button("Generate roster", type="primary", width="stretch",
@@ -197,13 +170,16 @@ with st.sidebar:
 def make_settings() -> sch.ScheduleSettings:
     """Collect every sidebar input into the single ScheduleSettings object.
 
-    Note: one "Night/weekend tolerance" input feeds BOTH fair_tol_night and
-    fair_tol_weekend (preserved from the prior app). No scheduling value is
-    hard-coded here -- defaults all come from sch.ScheduleSettings().
+    The UI is fixed-team only -- rotation_mode is left at its ScheduleSettings
+    default (fixed_team); rotate mode remains available in the engine/CLI via
+    rotation_mode=sch.ROTATE. Fairness tuning (tolerances + objective weights)
+    is intentionally not exposed here either -- the engine defaults apply. No
+    scheduling value is hard-coded here -- defaults all come from
+    sch.ScheduleSettings().
     """
     return sch.ScheduleSettings(
         year=int(year), month=int(month),
-        employees=employees, rotation_mode=rotation_mode, night_team=night_team,
+        employees=employees, night_team=night_team,
         day_min=int(day_min), day_max=int(day_max),
         night_min=int(night_min), night_max=int(night_max),
         shifts_per_employee=int(shifts),
@@ -211,10 +187,6 @@ def make_settings() -> sch.ScheduleSettings:
         min_consec_work=int(min_work), min_consec_off=int(min_off),
         max_consec_off=int(max_off),
         alternating_weekends=bool(alt_weekends),
-        fair_tol_night=int(tol_nw), fair_tol_weekend=int(tol_nw),
-        fair_tol_runs=int(tol_runs),
-        w_fair_total=int(w_total), w_fair_night=int(w_night),
-        w_fair_weekend=int(w_weekend), w_fair_runs=int(w_runs),
         solver_det_time_limit=float(det_budget),
     )
 
@@ -352,8 +324,8 @@ def status_banner(hard, fairness) -> None:
         st.info(
             f"All hard safety rules pass — this roster is valid and ready to publish. "
             f"{len(soft_fail)} soft fairness goal(s) couldn't be fully balanced this "
-            f"month (see the spread in the **Fairness** tab). Loosen a fairness "
-            f"tolerance or raise the solver budget to push the balance further.")
+            f"month (see the spread in the **Fairness** tab). Raise the solver "
+            f"budget (Advanced expander) to push the balance further.")
     else:
         st.error(
             f"{len(hard_fail)} hard rule(s) failed — do not publish. Open the "
@@ -510,7 +482,7 @@ elif "blocked" not in st.session_state and "infeasible" not in st.session_state:
     with st.container(border=True):
         st.markdown("##### Build a monthly roster")
         st.markdown(
-            "Set the month, staff, night-coverage model, and rules in the sidebar, "
+            "Set the month, staff, night team, and rules in the sidebar, "
             "then press **Generate roster**. You'll get a color-coded grid, an "
             "independent PASS/FAIL check of every rule, and a one-click Excel export.")
         legend()

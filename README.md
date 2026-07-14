@@ -17,9 +17,10 @@ reports each as **PASS/FAIL** with the measured value.
 - **Any month / year** — day count, start weekday, and Fri/Sat weekends are computed
   from your chosen month.
 - **Exactly 16 shifts per employee** (configurable, but exact — not a range).
-- **Two night-coverage models** — a **fixed night team of any size** that works nights only
-  (no day shifts, no circadian flipping), **or** a **full rotation** where every employee is
-  night-eligible and nights are spread across the whole roster.
+- **A fixed night team of any size** that works nights only (no day shifts, no circadian
+  flipping). A full-rotation mode also exists in the engine (`rotation_mode="rotate"`,
+  CLI/API) where every employee is night-eligible and nights spread across the whole
+  roster, but it is not exposed in the web UI.
 - **Smart night coverage** — at least 1 night every day, with overlap above the floor only
   on the days the math forces it (never a free-for-all).
 - **Fatigue rules** — no Night→Day next-day flip, day runs ≤ 4, night runs ≤ 3,
@@ -27,7 +28,8 @@ reports each as **PASS/FAIL** with the measured value.
 - **Fairness, four ways** — equal totals, balanced night load, balanced weekends (even
   Fri/Sat duty + a full weekend off each), and balanced "undesirable runs" (overlaps +
   max-length streaks) spread so no one absorbs the rough patterns. Each is reported
-  PASS/FAIL **with its measured spread**, and all are tunable.
+  PASS/FAIL **with its measured spread**, and all are tunable via `ScheduleSettings`
+  (not exposed in the web UI).
 - **Independent validator** — every rule re-checked from the grid and shown PASS/FAIL.
 - **Excel output** — a `Schedule` grid sheet + a `Summary`/validation sheet, color-coded.
 - **Browser UI** (Streamlit) — configure everything; no code editing required.
@@ -69,8 +71,8 @@ py -m venv .venv
 .venv\Scripts\streamlit run app.py
 ```
 
-Your browser opens to the app. Set the month, staff, night model, rules, and fairness in
-the sidebar, click **Generate roster**, review the roster, the per-employee fairness
+Your browser opens to the app. Set the month, staff, night team, and rules in the
+sidebar, click **Generate roster**, review the roster, the per-employee fairness
 summary, and the PASS/FAIL checks, then **Download Excel (.xlsx)**.
 
 ### Command line
@@ -120,7 +122,7 @@ ScheduleSettings ──▶ preflight() ──▶ build_and_solve() ──▶ val
 |---|---|---|
 | `year`, `month` | 2026, 8 | Calendar month to schedule |
 | `employees` | Employee 1–7 | The staff list (any size) |
-| `rotation_mode` | `"fixed_team"` | `"fixed_team"` (dedicated team) or `"rotate"` (everyone) |
+| `rotation_mode` | `"fixed_team"` | `"fixed_team"` (dedicated team) or `"rotate"` (everyone) *(engine/CLI only; not in the web UI)* |
 | `night_team` | Employee 6, 7 | Who works nights — **any size** (fixed_team mode) |
 | `night_team_nights_only` | `True` | Night team works nights only |
 | `day_min`, `day_max` | 2, 4 | Day staff required per day |
@@ -133,8 +135,8 @@ ScheduleSettings ──▶ preflight() ──▶ build_and_solve() ──▶ val
 | `max_consec_off` | 4 | Max consecutive off run |
 | `weekend_days` | Fri, Sat | The weekend (Saudi convention) |
 | `alternating_weekends` | `False` | **Hard** toggle (opt-in): full Fri+Sat weekends alternate off/on for every employee |
-| `fair_tol_total/night/weekend/runs` | 0 / 1 / 1 / 2 | Pass tolerance (max−min ≤) per fairness goal |
-| `w_fair_total/night/weekend/runs` | 100 each | Equal objective weights for the four goals |
+| `fair_tol_total/night/weekend/runs` | 0 / 1 / 1 / 2 | Pass tolerance (max−min ≤) per fairness goal *(engine/CLI only; not in the web UI)* |
+| `w_fair_total/night/weekend/runs` | 100 each | Equal objective weights for the four goals *(engine/CLI only; not in the web UI)* |
 | `solver_det_time_limit` | 24 | Deterministic search budget (reproducible) |
 
 > **Note on exactly-16 + a fixed night team.** A nights-only team of **N** members each

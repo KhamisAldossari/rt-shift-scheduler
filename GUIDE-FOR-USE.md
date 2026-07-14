@@ -12,8 +12,8 @@ You don't need to know any coding. Just follow the steps below.
 
 - Splits the month into **Day (D)**, **Night (N)**, and **Off (OFF)** shifts for each person.
 - Makes sure **everyone works exactly 16 shifts** — nobody does more, nobody does less.
-- Covers nights either with a **dedicated night team** (any number of people, who never do
-  day shifts) **or** by **rotating nights across everyone** — your choice.
+- Covers nights with a **dedicated night team** (any number of people, who never do
+  day shifts).
 - Follows safety rules automatically:
   - never a **night shift followed by a day shift** the next morning,
   - never more than **4 day shifts** in a row, or **3 nights** in a row,
@@ -102,10 +102,8 @@ You'll see a small table of names (Employee 1, Employee 2, …).
 - **Remove** a person by ticking the box at the left of their row, then pressing the
   **Delete** key (or the small trash icon at the top of the table).
 
-Then, under **Night coverage**, choose **one** of the two ways to handle nights:
-- **Fixed night team** — pick the people who cover nights that month (any number; they work
-  nights only).
-- **Everyone rotates nights** — no fixed team; the tool shares nights across all staff.
+Then, under **Night team**, pick the people who cover nights that month (any number; they
+work nights only).
 
 ### 3 · Staffing per day
 - **Min / Max day staff** — how many people you want on days each day (default 2–4).
@@ -170,9 +168,8 @@ you a schedule that quietly breaks a rule — it would rather stop and tell you.
 ## Why some rules are the way they are
 
 - **Exactly 16 shifts** keeps the workload equal for everyone.
-- **A dedicated night team** (when you choose one) means rested night staff instead of
-  everyone flipping between days and nights — or you can rotate nights across everyone if you
-  prefer.
+- **A dedicated night team** means rested night staff instead of everyone flipping between
+  days and nights.
 - **No night → day next morning** protects against the most tiring, error-prone pattern.
 - **Max 3 nights / 4 days in a row** keeps fatigue down.
 - **A full weekend off for everyone** (whenever the month allows it) keeps it fair.
