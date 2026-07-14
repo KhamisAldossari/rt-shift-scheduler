@@ -74,6 +74,33 @@ thin front-end over the engine.
   to hard without checking it keeps common months feasible. Some tight months can *provably*
   soft-fail a goal (e.g. N=3 nights-only February can't give all three a full weekend off) —
   that's honestly reported; every hard rule still holds.
+- **Alternating weekends (`alternating_weekends`) is a HARD toggle, not a soft goal.** It
+  **defaults OFF (opt-in)** so the out-of-box roster stays bit-identical to pristine main (both
+  the UI toggle and the CLI read this default). When on, every employee's full (Fri, Sat)
+  weekends strictly alternate off/on: of every two consecutive full weekends from
+  `weekend_pair_indices()`, exactly one is fully off (OFF on both days); the solver picks each
+  person's phase. Encoded in `build_and_solve()`
+  inside the goal-3 per-employee loop, reusing the same reified `offwknd_*` bits
+  (`model.Add(bits[w] + bits[w+1] == 1)`); re-derived independently in `validate()` as the
+  hard rule *"Weekends alternate off / on for every employee"* — same pair list, same
+  off-both-days test, same gating, so constraint and check score one quantity. **OFF-mode
+  bit-identity:** when the toggle is False, `build_and_solve()` adds no variable and no
+  constraint, so the model is byte-identical to the pre-feature engine (grid hashes diff
+  IDENTICAL against pristine main). `preflight()` adds a *necessary-not-sufficient* arithmetic
+  guard (worst-case weekend availability is `floor(pool/2)` per pool — disjoint pools for a
+  nights-only team, one shared floor otherwise). A tight config can be *provably INFEASIBLE*
+  with the toggle on even when the preflight guard passes (verified: the **default** 7-staff /
+  2-night-team config in February **2027** — `floor(5/2)=2 ≥ day_min` and `floor(2/2)=1 ≥
+  night_min` both hold, yet the joint packing is infeasible; the same config in February 2026
+  solves, so it depends on the weekday layout, not just month length) — the solver honestly
+  returns INFEASIBLE and `relaxation_hints()` surfaces "turn off alternating weekends". Turning the
+  toggle on can also push the **F3 "balanced weekends" soft goal to an honest FAIL** in some
+  month/pool shapes: strict alternation pins *which* weekends each person is off, so a small
+  night pool over an odd number of full weekends must split phases, forcing a weekend spread
+  above `fair_tol_weekend` (e.g. a 2-person night pool over 5 weekends → spread 2 > tol 1).
+  Every HARD rule still holds, so that is a contract-compliant soft FAIL, **not** the
+  OPTIMAL-but-FAIL landmine. Keep alt-on configs out of any all-PASS smoke assertion the way
+  the INFEASIBLE and tight soft-fail configs are kept out.
 - **Two places to update when adding a rule:** the constraint in `build_and_solve()` **and**
   an independent check in `validate()`. A rule that isn't in the validator isn't trusted.
   For a **fairness** goal, the objective term and the validator check must score the **same

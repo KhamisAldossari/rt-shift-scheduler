@@ -110,6 +110,7 @@ ScheduleSettings ──▶ preflight() ──▶ build_and_solve() ──▶ val
 | `min_consec_off` | 2 | Min consecutive off (must be 2) |
 | `max_consec_off` | 4 | Max consecutive off run |
 | `weekend_days` | Fri, Sat | The weekend (Saudi convention) |
+| `alternating_weekends` | `False` | **Hard** toggle (opt-in): full Fri+Sat weekends alternate off/on for every employee |
 | `fair_tol_total/night/weekend/runs` | 0 / 1 / 1 / 2 | Pass tolerance (max−min ≤) per fairness goal |
 | `w_fair_total/night/weekend/runs` | 100 each | Equal objective weights for the four goals |
 | `solver_det_time_limit` | 24 | Deterministic search budget (reproducible) |
@@ -131,7 +132,8 @@ exactly-16 shifts · day staffing within `[day_min, day_max]` · night coverage 
 `[night_min, night_max]` (never uncovered) · nights worked only by the night team, and the
 night team works nights only *(fixed-team mode)* · no Night→Day next day · day runs ≤
 `max_consec_work` · night runs ≤ `max_consec_night` · work runs ≥ 2 · off runs ≥ 2 and ≤
-`max_consec_off`.
+`max_consec_off` · alternating weekends *(when `alternating_weekends` is on — every
+employee's full Fri+Sat weekends alternate off/on, one fully off of each consecutive pair)*.
 
 **Best-effort fairness** (four equal-weighted soft objectives, surfaced as PASS/FAIL **plus
 the measured spread** by the validator): equal totals · balanced night load across

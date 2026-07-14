@@ -79,6 +79,12 @@ These are pre-set to safe values. You usually don't need to touch them:
 - Shifts per employee: **16**
 - Max day shifts in a row: **4** · Max nights in a row: **3**
 - Min work/off in a row: **2** · Max off in a row: **4**
+- **Alternating weekends** (off by default — turn it on when you want it): each person's
+  full Fri+Sat weekends go **off, on, off, on…** — so everyone gets every other weekend
+  fully off. It's a firm rule, not just a preference. On unusually tight months it can make
+  a schedule impossible (switch it off and generate again), and because it fixes *which*
+  weekends each person is off it can leave the "balanced weekends" fairness check red even
+  when every hard rule still holds.
 
 ### 5 · Generate
 Click the big **Generate roster** button.
@@ -130,6 +136,8 @@ you a schedule that quietly breaks a rule — it would rather stop and tell you.
 - **No night → day next morning** protects against the most tiring, error-prone pattern.
 - **Max 3 nights / 4 days in a row** keeps fatigue down.
 - **A full weekend off for everyone** keeps it fair.
+- **Alternating weekends** (when on) spreads the weekends evenly over time — nobody is
+  stuck working several weekends in a row while someone else always gets them off.
 
 The tool checks all of these for you and shows the green PASS marks as proof.
 
