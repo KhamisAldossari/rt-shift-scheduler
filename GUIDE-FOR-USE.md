@@ -26,7 +26,9 @@ You don't need to know any coding. Just follow the steps below.
 
 ## Starting the app (every time)
 
-1. Open the **Terminal** app on the Mac.
+### On a Mac
+
+1. Open the **Terminal** app.
 2. Type this and press **Enter** (this goes to the project folder):
    ```
    cd ~/Projects/shift-scheduler
@@ -40,12 +42,39 @@ You don't need to know any coding. Just follow the steps below.
 
 When you're done, go back to Terminal and press **Ctrl + C** to stop it. That's it.
 
-> **First time only:** if step 3 gives an error about something "not found," run this once,
-> then try step 3 again:
+> **First time only (Mac):** if step 3 gives an error about something "not found," run this
+> once, then try step 3 again:
 > ```
 > .venv/bin/pip install -r requirements.txt
 > ```
 > (If anything looks scary, just send Khamis a screenshot.)
+
+### On Windows
+
+1. Open **PowerShell** (press the **Windows key**, type `powershell`, press **Enter**).
+2. Type this and press **Enter** (this goes to the project folder):
+   ```
+   cd ~\Projects\shift-scheduler
+   ```
+3. Type this and press **Enter** (this starts the app):
+   ```
+   .venv\Scripts\streamlit run app.py
+   ```
+4. Your web browser opens the tool automatically. If it doesn't, PowerShell shows a
+   link like `http://localhost:8501` — hold **Ctrl** and click it (or copy it into
+   your browser).
+
+When you're done, go back to PowerShell and press **Ctrl + C** to stop it. That's it.
+
+> **First time only (Windows):** you need Python once — get it from
+> [python.org/downloads](https://www.python.org/downloads/) and, on the installer's first
+> screen, tick **"Add python.exe to PATH"**. Then run these two lines in PowerShell (from
+> the project folder), and try step 3 again:
+> ```
+> py -m venv .venv
+> .venv\Scripts\pip install -r requirements.txt
+> ```
+> (Same rule as always: anything scary → screenshot → Khamis.)
 
 ---
 
@@ -147,8 +176,8 @@ The tool checks all of these for you and shows the green PASS marks as proof.
 
 | Problem | Try this |
 |---|---|
-| Browser didn't open | Click the `http://localhost:8501` link in Terminal |
-| "command not found" on start | Run the first-time install line above |
+| Browser didn't open | Click the `http://localhost:8501` link in Terminal / PowerShell |
+| "command not found" / "not recognized" on start | Run the first-time install lines above (Mac or Windows) |
 | It says it can't schedule | Read the suggestion, change that one number, Generate again |
 | A rule shows **FAIL** in red | Don't publish yet — tell Khamis which rule failed |
 | Anything confusing | Screenshot it and send it to Khamis 🙂 |

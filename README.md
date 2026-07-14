@@ -39,8 +39,18 @@ reports each as **PASS/FAIL** with the measured value.
 - Python 3.9+
 - Packages in [`requirements.txt`](requirements.txt): `ortools`, `openpyxl`, `streamlit`, `pandas`
 
+One-time setup — create the virtual environment and install the packages:
+
 ```bash
+# macOS / Linux
+python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+```
+
+```powershell
+# Windows (PowerShell)
+py -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
 ```
 
 ---
@@ -50,7 +60,13 @@ reports each as **PASS/FAIL** with the measured value.
 ### Web app (recommended)
 
 ```bash
+# macOS / Linux
 .venv/bin/streamlit run app.py
+```
+
+```powershell
+# Windows (PowerShell)
+.venv\Scripts\streamlit run app.py
 ```
 
 Your browser opens to the app. Set the month, staff, night model, rules, and fairness in
@@ -60,7 +76,13 @@ summary, and the PASS/FAIL checks, then **Download Excel (.xlsx)**.
 ### Command line
 
 ```bash
+# macOS / Linux
 .venv/bin/python scheduler.py
+```
+
+```powershell
+# Windows (PowerShell)
+.venv\Scripts\python scheduler.py
 ```
 
 Builds the default roster (August 2026, 7 staff), prints the per-employee counts and
