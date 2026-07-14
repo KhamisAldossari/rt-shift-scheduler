@@ -107,6 +107,23 @@ class ScheduleSettings:
     # --- Fairness -----------------------------------------------------------
     weekend_days: tuple = ("Fri", "Sat")            # the "weekend" for fairness
 
+    # HARD toggle (NOT one of the four soft fairness goals): when True, every
+    # employee's full (Fri, Sat) weekends strictly alternate off/on/off/... --
+    # of every two consecutive full weekends, exactly one is fully off. The
+    # solver picks each person's phase; months with < 2 full weekends make it
+    # vacuous. Unlike w_fair_* it is enforced as a constraint and re-derived as a
+    # PASS/FAIL hard rule, never a spread. Setting it False leaves the model
+    # byte-identical to the pre-feature engine, so it defaults OFF (opt-in):
+    # pinning WHICH weekends each person is off can over-constrain a tight month
+    # to INFEASIBLE (e.g. the default 7-staff / 2-night-team config in a 28-day
+    # February), and it structurally fights the F3 "even Fri/Sat duty" sub-goal
+    # (a small night pool over an odd number of full weekends must split phases,
+    # forcing a weekend spread > fair_tol_weekend). Both are honestly surfaced --
+    # preflight/relaxation_hints for the former, an honest soft F3 FAIL (every
+    # HARD rule still holds) for the latter -- so neither belongs in the
+    # out-of-box experience.
+    alternating_weekends: bool = False
+
     # Tolerances: a fairness goal PASSES when its measured spread (max - min)
     # is within tolerance. Loose by default so common months stay green; tighten
     # from the UI to demand stricter fairness. Totals are pinned exact (spread 0).
@@ -303,6 +320,36 @@ def preflight(settings: ScheduleSettings) -> list[Problem]:
                 "Widen a run-length cap, or change shifts/employee.")
         return None
 
+    # --- Alternating weekends (HARD toggle; applies to BOTH modes) ----------
+    # Strict off/on alternation puts every employee off on ~half the full
+    # weekends, so the solver can split a pool of P into phases of at most
+    # ceil(P/2) and floor(P/2); whichever is on the "worst" weekend leaves only
+    # floor(P/2) available. Necessary (NOT sufficient): that worst-case half must
+    # still meet the daily floor. Disjoint pools (nights-only team) are checked
+    # per pool; overlapping pools (rotate, or a team that also works days) share
+    # one floor. Only meaningful with >= 2 full weekends (else the rule is vacuous).
+    if S.alternating_weekends and len(weekend_pair_indices(S)) >= 2:
+        pools_disjoint = (not S.is_rotate) and S.night_team_nights_only
+        if pools_disjoint:
+            n_day = len(day_capable_indices(S))
+            n_ni = len(night_eligible_indices(S))
+            if n_day // 2 < S.day_min:
+                problems.append(Problem(
+                    f"Alternating weekends: at most {n_day // 2} of {n_day} day-capable "
+                    f"staff can be on any weekend, below the {S.day_min} day-staff minimum.",
+                    "Turn off alternating weekends, lower min day staff, or add day staff."))
+            if n_ni // 2 < S.night_min:
+                problems.append(Problem(
+                    f"Alternating weekends: at most {n_ni // 2} of {n_ni} night-eligible "
+                    f"staff can be on any weekend, below the {S.night_min} nights/day minimum.",
+                    "Turn off alternating weekends, lower min nights/day, or add night staff."))
+        else:
+            if n_emp // 2 < S.day_min + S.night_min:
+                problems.append(Problem(
+                    f"Alternating weekends: at most {n_emp // 2} of {n_emp} staff can be on "
+                    f"any weekend, below the {S.day_min + S.night_min} day+night daily floor.",
+                    "Turn off alternating weekends, lower the daily minimums, or add staff."))
+
     # --- Mode B: everyone rotates nights -----------------------------------
     if S.is_rotate:
         total_shifts = w * n_emp
@@ -381,13 +428,18 @@ def relaxation_hints(settings: ScheduleSettings) -> list[str]:
     still proves no schedule exists (the binding conflict is a combination, not a
     single arithmetic check)."""
     S = settings
-    return [
+    hints = [
         f"Widen the day-staffing band (e.g. max day staff {S.day_max} -> {S.day_max + 1}).",
         f"Raise max consecutive off ({S.max_consec_off} -> {S.max_consec_off + 1}) "
         f"or max consecutive day run ({S.max_consec_work} -> {S.max_consec_work + 1}).",
         f"Allow more night overlap (max nights/day {S.night_max} -> {S.night_max + 1}).",
         "Reduce shifts/employee by 1 to loosen the packing.",
     ]
+    if S.alternating_weekends:
+        hints.append(
+            "Turn off alternating weekends -- forcing every employee off on every "
+            "other full weekend can over-constrain a tight month.")
+    return hints
 
 
 # ---------------------------------------------------------------------------
@@ -530,6 +582,17 @@ def build_and_solve(settings: ScheduleSettings) -> Solution:
         else:
             model.Add(h == 0)
         has_full_off.append(h)
+
+        # HARD toggle -- strict alternating weekends. Reusing the same reified
+        # `bits` (bit == 1 iff that full weekend is fully off), force off/on to
+        # alternate: of every two consecutive full weekends exactly one is off.
+        # Same `bits`, same weekend_pairs, same gating as validate(), so the
+        # constraint and the independent check score ONE quantity. When the
+        # toggle is False this adds no variable and no constraint, so the model
+        # stays byte-identical to the pre-feature engine.
+        if S.alternating_weekends:
+            for w in range(len(bits) - 1):
+                model.Add(bits[w] + bits[w + 1] == 1)
     num_no_full_off = n - sum(has_full_off)
     weekend_term = gap_wknd + num_no_full_off
 
@@ -820,6 +883,26 @@ def validate(settings: ScheduleSettings, grid: list[list[str]]) -> list[RuleResu
         f"Max {S.max_consec_off} consecutive off days",
         max_off_run <= S.max_consec_off,
         f"longest off streak={max_off_run}"))
+
+    # Alternating weekends (HARD, present only when the toggle is on). Re-derived
+    # from the grid alone: a full weekend is "off" iff the employee is OFF on both
+    # its Fri and Sat; strict alternation is violated whenever two CONSECUTIVE
+    # full weekends share the same on/off state. Mirrors the model constraint
+    # exactly (same weekend_pairs, same off-both-days test, same gating), so a
+    # solver OPTIMAL and this check can never disagree. Vacuous (<2 full weekends).
+    if S.alternating_weekends:
+        alt_viol = []
+        for e in range(n):
+            off = [grid[e][f] == OFF and grid[e][s] == OFF for (f, s) in weekend_pairs]
+            for w in range(len(off) - 1):
+                if off[w] == off[w + 1]:
+                    f1, f2 = weekend_pairs[w][0], weekend_pairs[w + 1][0]
+                    alt_viol.append((S.employees[e], f"D{f1 + 1}&D{f2 + 1}"))
+        results.append(RuleResult(
+            "Weekends alternate off / on for every employee",
+            not alt_viol,
+            f"{len(weekend_pairs)} full weekends; alternation holds" if not alt_viol
+            else f"{len(alt_viol)} violation(s): {alt_viol[:6]}"))
 
     # ===================== FAIRNESS (4 soft goals) ========================
     # Each reports PASS/FAIL against a tunable tolerance, plus the spread.

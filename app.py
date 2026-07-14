@@ -161,6 +161,12 @@ with st.sidebar:
                               help="The model encodes a minimum of 2; other values are "
                                    "reported as infeasible by preflight.")
     max_off = st.number_input("Max consecutive off", 1, 14, defaults.max_consec_off)
+    alt_weekends = st.toggle(
+        "Alternating weekends (hard)", value=defaults.alternating_weekends,
+        help="On: every employee's full Fri+Sat weekends strictly alternate "
+             "off / on / off — of every two consecutive full weekends, exactly one "
+             "is fully off. A HARD rule (not a soft fairness goal); it can make very "
+             "tight months infeasible, in which case turn it off and re-generate.")
 
     st.subheader("6 · Fairness")
     st.caption("All four fairness goals are soft. A goal PASSES when its spread "
@@ -204,6 +210,7 @@ def make_settings() -> sch.ScheduleSettings:
         max_consec_work=int(max_day), max_consec_night=int(max_night),
         min_consec_work=int(min_work), min_consec_off=int(min_off),
         max_consec_off=int(max_off),
+        alternating_weekends=bool(alt_weekends),
         fair_tol_night=int(tol_nw), fair_tol_weekend=int(tol_nw),
         fair_tol_runs=int(tol_runs),
         w_fair_total=int(w_total), w_fair_night=int(w_night),
