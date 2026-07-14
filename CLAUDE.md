@@ -40,7 +40,11 @@ thin front-end over the engine.
   eligible for nights. *rotate* — no team; **every** employee is night-eligible and nights
   rotate across the roster, balanced softly (no hard per-person night cap). Role membership
   is resolved per mode by `night_eligible_indices()` / `day_capable_indices()`; never
-  hard-code who works nights.
+  hard-code who works nights. **The web UI deliberately exposes only `fixed_team`** —
+  `rotate` stays available engine/CLI-only (`rotation_mode=sch.ROTATE`). Likewise the
+  fairness tolerances (`fair_tol_*`) and objective weights (`w_fair_*`) are deliberately
+  not in the UI. Both are hidden by product decision — do not re-add either without being
+  asked.
 - **Forced night overlap (fixed_team).** N nights-only members on exactly-16 ⇒ a fixed
   **16·N night-shifts/month** ⇒ forced overlap above the floor =
   `max(0, 16·N − night_min·days)`. The validator checks this as *"Night overlap is minimal
