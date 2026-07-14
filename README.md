@@ -125,6 +125,8 @@ ScheduleSettings ──▶ preflight() ──▶ build_and_solve() ──▶ val
 | `rotation_mode` | `"fixed_team"` | `"fixed_team"` (dedicated team) or `"rotate"` (everyone) *(engine/CLI only; not in the web UI)* |
 | `night_team` | Employee 6, 7 | Who works nights — **any size** (fixed_team mode) |
 | `night_team_nights_only` | `True` | Night team works nights only |
+| `am_team` | (empty) | AM-shift staff on a fixed weekly pattern, appended to the roster **outside the solver** (not scheduled, counted, or validated) |
+| `am_days` | Sun–Thu | The weekdays AM staff work each week (configurable) |
 | `day_min`, `day_max` | 2, 4 | Day staff required per day |
 | `night_min`, `night_max` | 1, 2 | Night coverage band per day |
 | `shifts_per_employee` | 16 | **Exact** monthly total per person |
@@ -175,7 +177,8 @@ than silently dropping it — the roster stays valid because every hard rule sti
 
 - **Schedule** — rows = employees, columns = days (`D1 Sun … DN`), each cell is
   `D` (day), `N` (night), or `OFF`, color-coded; trailing Total / Day / Night / Fri-Sat
-  columns. Weekends (Fri/Sat) are highlighted in the header.
+  columns. Weekends (Fri/Sat) are highlighted in the header. Any AM-shift staff appear
+  as extra rows below (`AM` on their working weekdays), outside the solver.
 - **Summary** — a per-employee fairness summary (Total / Day / Night / Fri-Sat / Rough), the
   night split + overlap-night-day count, and the full rule-validation table (PASS/FAIL +
   measured).

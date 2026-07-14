@@ -105,6 +105,10 @@ You'll see a small table of names (Employee 1, Employee 2, …).
 Then, under **Night team**, pick the people who cover nights that month (any number; they
 work nights only).
 
+If you have **AM staff** (people on a fixed weekly pattern — for example Sun–Thu), add
+their names under **AM shift** and pick their working days. They show up on the roster too,
+but they're kept separate from the shift math above.
+
 ### 3 · Staffing per day
 - **Min / Max day staff** — how many people you want on days each day (default 2–4).
 - **Min / Max nights per day** — just leave these at **1 and 2**. On a few days two people
@@ -141,6 +145,7 @@ Click the big **Generate roster** button.
   - 🟩 **D** = Day shift
   - 🟦 **N** = Night shift
   - 🟥 **OFF** = Day off
+  - 🟨 **AM** = AM shift (a fixed set of weekdays)
   - a small **\*** next to a name = night-team member
 - The **Per-employee fairness summary** shows each person's Total / Day / Night / Fri-Sat and
   how many rough patterns (overlap nights, long streaks) they got — so you can see the load
