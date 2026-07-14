@@ -125,7 +125,21 @@ with st.sidebar:
     else:
         st.caption(f"{len(night_team)} night-team member(s) selected.")
 
-    st.subheader("4 · Staffing per day")
+    st.subheader("4 · AM shift")
+    st.caption("Fixed-pattern staff rostered outside the solver — appended as extra "
+               "rows, not part of coverage or fairness. Leave empty if unused.")
+    am_df = st.data_editor(
+        pd.DataFrame({"AM staff": pd.Series(list(defaults.am_team), dtype="object")}),
+        num_rows="dynamic", width="stretch", hide_index=True, key="am_editor",
+        column_config={"AM staff": st.column_config.TextColumn(
+            "AM staff", width="large", help="One row per AM-shift person.")})
+    am_team = [str(x).strip() for x in am_df["AM staff"].tolist() if str(x).strip()]
+    am_days = st.multiselect(
+        "AM working days", options=sch.WEEKDAY_NAMES,
+        default=list(defaults.am_days),
+        help="The weekdays AM staff work every week (default Sun–Thu).")
+
+    st.subheader("5 · Staffing per day")
     c1, c2 = st.columns(2)
     day_min = c1.number_input("Min day staff", 0, 50, defaults.day_min)
     day_max = c2.number_input("Max day staff", 1, 50, defaults.day_max)
@@ -133,7 +147,7 @@ with st.sidebar:
     night_min = c3.number_input("Min nights/day", 0, 10, defaults.night_min)
     night_max = c4.number_input("Max nights/day (overlap)", 1, 10, defaults.night_max)
 
-    st.subheader("5 · Rules")
+    st.subheader("6 · Rules")
     shifts = st.number_input("Shifts per employee (exact)", 1, 31,
                              defaults.shifts_per_employee)
     c5, c6 = st.columns(2)
@@ -180,6 +194,7 @@ def make_settings() -> sch.ScheduleSettings:
     return sch.ScheduleSettings(
         year=int(year), month=int(month),
         employees=employees, night_team=night_team,
+        am_team=am_team, am_days=tuple(am_days),
         day_min=int(day_min), day_max=int(day_max),
         night_min=int(night_min), night_max=int(night_max),
         shifts_per_employee=int(shifts),
@@ -196,18 +211,23 @@ def make_settings() -> sch.ScheduleSettings:
 # ---------------------------------------------------------------------------
 
 def grid_dataframe(S: sch.ScheduleSettings, grid: list[list[str]]) -> pd.DataFrame:
-    """The roster as a DataFrame: rows = employees, columns = D1..Dn (weekday)."""
+    """The roster as a DataFrame: rows = employees (+ any AM staff), columns = D1..Dn."""
     cols = [f"D{d + 1} {sch.weekday_of(S, d)}" for d in range(S.days)]
     rows = [S.employees[e] + (" ∗" if sch.is_night_member(S, e) else "")
             for e in range(len(S.employees))]
     data = [[sch.CELL_LABEL[grid[e][d]] for d in range(S.days)]
             for e in range(len(S.employees))]
+    # AM staff live entirely outside the solver: their fixed-pattern rows come
+    # straight from sch.am_rows() (never recomputed here) and are appended below.
+    for a, arow in enumerate(sch.am_rows(S)):
+        rows.append(S.am_team[a] + " (AM)")
+        data.append([sch.CELL_LABEL[arow[d]] for d in range(S.days)])
     return pd.DataFrame(data, index=rows, columns=cols)
 
 
 def color_cell(val: str) -> str:
     """Mirror the openpyxl fills so the web grid matches the Excel exactly."""
-    code = {"D": sch.DAY, "N": sch.NIGHT, "OFF": sch.OFF}.get(val)
+    code = {"D": sch.DAY, "N": sch.NIGHT, "OFF": sch.OFF, "AM": sch.AM}.get(val)
     bg = sch.WEB_COLORS.get(code, "#FFFFFF")
     return f"background-color: {bg}; text-align: center; color: #13233B; font-weight: 600;"
 
@@ -221,11 +241,13 @@ def color_result(val: str) -> str:
     return ""
 
 
-def legend() -> None:
+def legend(show_am: bool = False) -> None:
     """A compact key whose swatches are the EXACT grid colors (WEB_COLORS)."""
     items = [(sch.WEB_COLORS[sch.DAY], "D", "Day"),
              (sch.WEB_COLORS[sch.NIGHT], "N", "Night"),
              (sch.WEB_COLORS[sch.OFF], "OFF", "Off")]
+    if show_am:
+        items.append((sch.WEB_COLORS[sch.AM], "AM", "AM"))
     html = ['<div class="legend">']
     for bg, code, label in items:
         html.append(
@@ -422,7 +444,7 @@ if "result" in st.session_state:
 
     # ======================= ROSTER (the hero) ==============================
     with tab_roster:
-        legend()
+        legend(show_am=bool(S.am_team))
         render_grid(S, R["grid"])
         st.divider()
         st.markdown("##### Daily coverage")

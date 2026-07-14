@@ -57,6 +57,9 @@ from openpyxl.utils import get_column_letter
 
 # Shift codes used throughout.
 DAY, NIGHT, OFF = "D", "N", "O"
+# AM staff work a fixed weekly pattern and live entirely outside the solver (see
+# am_rows): they are appended to the roster, never scheduled, counted, or validated.
+AM = "AM"
 
 # Rotation modes (how nights are covered).
 FIXED_TEAM, ROTATE = "fixed_team", "rotate"
@@ -87,6 +90,14 @@ class ScheduleSettings:
     night_team: list[str] = field(
         default_factory=lambda: ["Employee 6", "Employee 7"])
     night_team_nights_only: bool = True             # fixed_team: no day shifts
+
+    # --- AM shift -----------------------------------------------------------
+    # AM staff work a FIXED weekly pattern (am_days) and are entirely OUTSIDE the
+    # solver: never scheduled, counted for coverage, or validated -- just appended
+    # to the roster as extra rows. am_team defaults empty (the feature is opt-in);
+    # am_days defaults to the Saudi workweek (Sun-Thu) and is configurable.
+    am_team: list[str] = field(default_factory=list)
+    am_days: tuple = ("Sun", "Mon", "Tue", "Wed", "Thu")
 
     # --- Staffing bands -----------------------------------------------------
     day_min: int = 2                                # day staff required per day
@@ -254,6 +265,25 @@ def roster_caption(settings: ScheduleSettings) -> str:
 
 
 # ---------------------------------------------------------------------------
+# AM SHIFT  (fixed weekly-pattern staff, entirely outside the solver)
+# ---------------------------------------------------------------------------
+
+def am_rows(settings: ScheduleSettings) -> list[list[str]]:
+    """One roster row per AM-shift member, index-aligned with settings.am_team.
+
+    AM staff live entirely OUTSIDE the solver: they are never modelled as
+    constraints, never counted in coverage or fairness, and never validated --
+    they are simply appended as extra rows to the finished roster (the Streamlit
+    grid and the Excel sheet). Cell d is AM when that calendar day's weekday name
+    is in am_days, else OFF. Weekday names are derived exactly the way the rest of
+    the engine derives them (weekday_of), so AM rows share the roster's calendar.
+    """
+    return [[AM if weekday_of(settings, d) in settings.am_days else OFF
+             for d in range(settings.days)]
+            for _ in settings.am_team]
+
+
+# ---------------------------------------------------------------------------
 # FEASIBILITY PRE-FLIGHT  (catches a bad rule set before the solver, and -- per
 # the UI choice -- pairs each problem with a concrete, non-binding suggestion)
 # ---------------------------------------------------------------------------
@@ -275,11 +305,42 @@ def preflight(settings: ScheduleSettings) -> list[Problem]:
     n_emp = len(S.employees)
     w = S.shifts_per_employee
 
+    # --- AM shift (fixed-pattern staff, entirely outside the solver) --------
+    # AM staff are appended as extra roster rows, never modelled, so their only
+    # failure modes are naming / config mistakes. Cheap, mode-independent checks,
+    # each paired with a concrete suggestion (like every other Problem). They run
+    # before the empty-roster early return so AM mistakes are never masked.
+    am_overlap = [name for name in S.am_team if name in S.employees]
+    if am_overlap:
+        problems.append(Problem(
+            f"AM staff also appear in the scheduled employee list: {', '.join(am_overlap)}.",
+            "Remove these names from either the AM list or the employee list -- AM "
+            "staff are rostered separately, outside the solver."))
+    am_seen, am_dupes = set(), []
+    for name in S.am_team:
+        if name in am_seen and name not in am_dupes:
+            am_dupes.append(name)
+        am_seen.add(name)
+    if am_dupes:
+        problems.append(Problem(
+            f"Duplicate name(s) in the AM list: {', '.join(am_dupes)}.",
+            "Give each AM staff member a single, unique row."))
+    bad_am_days = [d for d in S.am_days if d not in WEEKDAY_NAMES]
+    if bad_am_days:
+        problems.append(Problem(
+            f"AM working days include invalid weekday name(s): {', '.join(bad_am_days)}.",
+            f"Use weekday names from {', '.join(WEEKDAY_NAMES)}."))
+    if S.am_team and not S.am_days:
+        problems.append(Problem(
+            "AM staff are configured but no AM working days are set.",
+            "Pick at least one AM working day, or clear the AM staff list."))
+
     # --- Basic shape (mode-independent) ------------------------------------
     if n_emp == 0:
         problems.append(Problem("No employees configured.",
                                 "Add at least 3-4 employees."))
         return problems
+
     if S.min_consec_work != 2 or S.min_consec_off != 2:
         problems.append(Problem(
             "Minimum consecutive work/off must be 2 (the model encodes exactly 2).",
@@ -970,6 +1031,7 @@ FILL_PASS = PatternFill("solid", fgColor="C6EFCE")
 FILL_FAIL = PatternFill("solid", fgColor="FFC7CE")
 FILL_HEADER = PatternFill("solid", fgColor="305496")
 FILL_WEEKEND = PatternFill("solid", fgColor="FFF2CC")
+FILL_AM = PatternFill("solid", fgColor="FFE699")    # AM shift (fixed-pattern staff)
 
 FONT_HEADER = Font(bold=True, color="FFFFFF")
 FONT_BOLD = Font(bold=True)
@@ -977,11 +1039,11 @@ CENTER = Alignment(horizontal="center", vertical="center")
 THIN = Side(style="thin", color="BFBFBF")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
-CELL_LABEL = {DAY: "D", NIGHT: "N", OFF: "OFF"}
-CELL_FILL = {DAY: FILL_DAY, NIGHT: FILL_NIGHT, OFF: FILL_OFF}
+CELL_LABEL = {DAY: "D", NIGHT: "N", OFF: "OFF", AM: "AM"}
+CELL_FILL = {DAY: FILL_DAY, NIGHT: FILL_NIGHT, OFF: FILL_OFF, AM: FILL_AM}
 
 # Hex colors reused by the Streamlit grid so the two views match.
-WEB_COLORS = {DAY: "#C6EFCE", NIGHT: "#BDD7EE", OFF: "#FFC7CE"}
+WEB_COLORS = {DAY: "#C6EFCE", NIGHT: "#BDD7EE", OFF: "#FFC7CE", AM: "#FFE699"}
 
 
 def _style(cell, value="", fill=None, font=None, align=CENTER, border=True):
@@ -1048,9 +1110,29 @@ def _write_roster(settings: ScheduleSettings, ws, grid: list[list[str]]) -> None
         for j, val in enumerate([total, day_n, night_n, wknd_n]):
             _style(ws.cell(2 + e, 2 + days + j), val, font=FONT_BOLD)
 
-    legend_row = len(S.employees) + 4
+    # AM staff: appended after the scheduled roster as extra rows (fixed weekly
+    # pattern, entirely outside the solver -- no coverage/fairness accounting).
+    # Their Day/Night stat columns are 0 by definition; Total = AM days worked,
+    # Fri/Sat = AM days landing on the weekend.
+    am = am_rows(S)
+    base = 2 + len(S.employees)
+    for a, arow in enumerate(am):
+        _style(ws.cell(base + a, 1), S.am_team[a] + "  (AM)", font=FONT_BOLD,
+               align=Alignment(horizontal="left", vertical="center"))
+        for d in range(days):
+            code = arow[d]
+            _style(ws.cell(base + a, 2 + d), CELL_LABEL[code], CELL_FILL[code])
+        total = sum(1 for d in range(days) if arow[d] != OFF)
+        wknd_n = sum(1 for d in weekend if arow[d] != OFF)
+        for j, val in enumerate([total, 0, 0, wknd_n]):
+            _style(ws.cell(base + a, 2 + days + j), val, font=FONT_BOLD)
+
+    legend_row = len(S.employees) + len(S.am_team) + 4
     _style(ws.cell(legend_row, 1), "Legend:", font=FONT_BOLD, border=False)
-    for j, (code, text) in enumerate([(DAY, "Day shift"), (NIGHT, "Night shift"), (OFF, "Off")]):
+    legend_items = [(DAY, "Day shift"), (NIGHT, "Night shift"), (OFF, "Off")]
+    if S.am_team:
+        legend_items.append((AM, "AM shift"))
+    for j, (code, text) in enumerate(legend_items):
         _style(ws.cell(legend_row, 2 + j * 2), CELL_LABEL[code], CELL_FILL[code])
         _style(ws.cell(legend_row, 3 + j * 2), text, border=False,
                align=Alignment(horizontal="left", vertical="center"))
