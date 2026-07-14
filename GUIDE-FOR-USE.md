@@ -17,7 +17,8 @@ You don't need to know any coding. Just follow the steps below.
 - Follows safety rules automatically:
   - never a **night shift followed by a day shift** the next morning,
   - never more than **4 day shifts** in a row, or **3 nights** in a row,
-  - everyone gets a **full Friday + Saturday weekend off** at least once,
+  - it does its best to give everyone a **full Friday + Saturday weekend off** (and it
+    tells you honestly if a tight month can't manage it),
   - rest days are spread out (never more than 4 days off in a row, never a single lonely off day).
 - Checks **every rule itself** and shows you a green **PASS** or red **FAIL** for each one,
   so you can trust it before you share it.
@@ -26,9 +27,13 @@ You don't need to know any coding. Just follow the steps below.
 
 ## Starting the app (every time)
 
+> **Before the very first start on a new computer:** get the `shift-scheduler` folder from
+> Khamis (he'll send a zip or a link) and put it in your home folder inside a folder called
+> `Projects` — so it ends up at `Projects/shift-scheduler`. Everything below assumes it's there.
+
 ### On a Mac
 
-1. Open the **Terminal** app.
+1. Open the **Terminal** app (press **Cmd + Space**, type `terminal`, press **Enter**).
 2. Type this and press **Enter** (this goes to the project folder):
    ```
    cd ~/Projects/shift-scheduler
@@ -39,12 +44,15 @@ You don't need to know any coding. Just follow the steps below.
    ```
 4. Your web browser opens the tool automatically. If it doesn't, the Terminal shows a
    link like `http://localhost:8501` — hold **Cmd** and click it.
+5. Leave the Terminal window open while you use the tool — closing it stops the app.
 
-When you're done, go back to Terminal and press **Ctrl + C** to stop it. That's it.
+When you're done, go back to Terminal and press **Ctrl + C** to stop it (yes, **Ctrl** —
+not Cmd — that's just how Terminal works). That's it.
 
-> **First time only (Mac):** if step 3 gives an error about something "not found," run this
-> once, then try step 3 again:
+> **First time only (Mac):** if step 3 gives an error about something "not found," run these
+> two lines once (from the project folder), then try step 3 again:
 > ```
+> python3 -m venv .venv
 > .venv/bin/pip install -r requirements.txt
 > ```
 > (If anything looks scary, just send Khamis a screenshot.)
@@ -63,6 +71,7 @@ When you're done, go back to Terminal and press **Ctrl + C** to stop it. That's 
 4. Your web browser opens the tool automatically. If it doesn't, PowerShell shows a
    link like `http://localhost:8501` — hold **Ctrl** and click it (or copy it into
    your browser).
+5. Leave the PowerShell window open while you use the tool — closing it stops the app.
 
 When you're done, go back to PowerShell and press **Ctrl + C** to stop it. That's it.
 
@@ -90,30 +99,32 @@ and which days are Fri/Sat — you don't have to.
 You'll see a small table of names (Employee 1, Employee 2, …).
 - **Rename** anyone by clicking a name and typing the real person's name.
 - **Add** a person with the **+** at the bottom of the table.
-- **Remove** a person by selecting their row and deleting it.
+- **Remove** a person by ticking the box at the left of their row, then pressing the
+  **Delete** key (or the small trash icon at the top of the table).
 
-Then, under **Night coverage**, choose how nights are handled:
+Then, under **Night coverage**, choose **one** of the two ways to handle nights:
 - **Fixed night team** — pick the people who cover nights that month (any number; they work
-  nights only). Or
+  nights only).
 - **Everyone rotates nights** — no fixed team; the tool shares nights across all staff.
 
 ### 3 · Staffing per day
 - **Min / Max day staff** — how many people you want on days each day (default 2–4).
-- **Min / Max nights per day** — leave at **1 and 2** for a 2-person team. The "max" lets the
-  night people finish their 16 shifts; the tool only stacks an extra night on the few days it
-  has to. (A bigger night team may need a higher max — the tool tells you if so.)
+- **Min / Max nights per day** — just leave these at **1 and 2**. On a few days two people
+  will both be working the same night (extra coverage — not a split shift); that's normal,
+  and the tool keeps it to as few days as possible.
+  (If you pick a bigger night team and a number needs to change, the tool tells you.)
 
 ### 4 · Rules
 These are pre-set to safe values. You usually don't need to touch them:
 - Shifts per employee: **16**
 - Max day shifts in a row: **4** · Max nights in a row: **3**
 - Min work/off in a row: **2** · Max off in a row: **4**
-- **Alternating weekends** (off by default — turn it on when you want it): each person's
-  full Fri+Sat weekends go **off, on, off, on…** — so everyone gets every other weekend
-  fully off. It's a firm rule, not just a preference. On unusually tight months it can make
-  a schedule impossible (switch it off and generate again), and because it fixes *which*
-  weekends each person is off it can leave the "balanced weekends" fairness check red even
-  when every hard rule still holds.
+- **Alternating weekends** (off unless you switch it on): everyone's weekends go
+  **off, on, off, on…** — every other Fri+Sat fully off, guaranteed. Two things to know:
+  on a very tight month the tool may say no schedule is possible (just switch it off and
+  Generate again), and the "balanced weekends" check (a separate, best-effort evenness
+  check — not this switch) can show red — the roster is still safe; it only means the
+  weekend counts aren't perfectly even that month.
 
 ### 5 · Generate
 Click the big **Generate roster** button.
@@ -122,11 +133,11 @@ Click the big **Generate roster** button.
 
 ## Reading the result
 
-- A green banner **"All rules PASS — safe to publish"** means you're good to go. 🎉
-- A **blue** banner means **all the safety rules pass and the roster is valid**, but one
-  *fairness* goal couldn't be made perfect this month (only happens on unusually tight
-  months) — it's still safe to publish; you can loosen a tolerance or raise the solver
-  budget if you want it even more even.
+- A green banner saying **all rules pass — ready to publish** means you're good to go. 🎉
+- A **blue** banner means **all the safety rules pass and the roster is valid**, but the
+  workload split couldn't be made perfectly even this month (only happens on unusually
+  tight months) — it's still safe to publish. If it bothers you, tell Khamis and he'll
+  tune it.
 - A **red** banner would mean a **safety rule** failed — don't publish (this shouldn't happen).
 - The **Roster** table shows everyone's month:
   - 🟩 **D** = Day shift
@@ -164,7 +175,7 @@ you a schedule that quietly breaks a rule — it would rather stop and tell you.
   prefer.
 - **No night → day next morning** protects against the most tiring, error-prone pattern.
 - **Max 3 nights / 4 days in a row** keeps fatigue down.
-- **A full weekend off for everyone** keeps it fair.
+- **A full weekend off for everyone** (whenever the month allows it) keeps it fair.
 - **Alternating weekends** (when on) spreads the weekends evenly over time — nobody is
   stuck working several weekends in a row while someone else always gets them off.
 
@@ -179,7 +190,8 @@ The tool checks all of these for you and shows the green PASS marks as proof.
 | Browser didn't open | Click the `http://localhost:8501` link in Terminal / PowerShell |
 | "command not found" / "not recognized" on start | Run the first-time install lines above (Mac or Windows) |
 | It says it can't schedule | Read the suggestion, change that one number, Generate again |
-| A rule shows **FAIL** in red | Don't publish yet — tell Khamis which rule failed |
+| A **hard rule** shows FAIL in red | Don't publish — tell Khamis which rule (this shouldn't happen) |
+| A **fairness** goal shows FAIL | Still safe to publish — mention it to Khamis only if you want it evened out |
 | Anything confusing | Screenshot it and send it to Khamis 🙂 |
 
 You've got this, Mishary. — Khamis
