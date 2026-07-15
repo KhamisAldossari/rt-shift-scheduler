@@ -36,6 +36,7 @@ Run:  ./.venv/bin/streamlit run app.py
 from __future__ import annotations
 
 import calendar
+import datetime
 
 import pandas as pd
 import streamlit as st
@@ -139,7 +140,39 @@ with st.sidebar:
         default=list(defaults.am_days),
         help="The weekdays AM staff work every week (default Sun–Thu).")
 
-    st.subheader("5 · Staffing per day")
+    st.subheader("5 · Leave")
+    st.caption("Vacation inside the month: those days are blocked ('V') and the "
+               "person's shift target drops by one per leave day. One row per "
+               "range; several rows per person are fine. Rows missing a name or "
+               "a date are ignored.")
+    month_first = datetime.date(int(year), int(month), 1)
+    month_last = datetime.date(int(year), int(month),
+                               calendar.monthrange(int(year), int(month))[1])
+    leave_df = st.data_editor(
+        pd.DataFrame({"Employee": pd.Series(dtype="object"),
+                      "From": pd.Series(dtype="object"),
+                      "To": pd.Series(dtype="object")}),
+        num_rows="dynamic", width="stretch", hide_index=True, key="leave_editor",
+        column_config={
+            "Employee": st.column_config.SelectboxColumn(
+                "Employee", options=employees, width="medium",
+                help="Scheduled staff only — AM staff cannot take rostered leave."),
+            "From": st.column_config.DateColumn(
+                "From", min_value=month_first, max_value=month_last),
+            "To": st.column_config.DateColumn(
+                "To", min_value=month_first, max_value=month_last),
+        })
+    # Collect complete rows only (name + both dates); every rule-level check --
+    # unknown names, reversed or out-of-month ranges -- stays in preflight.
+    leave_rows = []
+    for _, lrow in leave_df.iterrows():
+        name, d_from, d_to = lrow.get("Employee"), lrow.get("From"), lrow.get("To")
+        if pd.isna(name) or not str(name).strip() or pd.isna(d_from) or pd.isna(d_to):
+            continue
+        leave_rows.append((str(name).strip(),
+                           pd.Timestamp(d_from).date(), pd.Timestamp(d_to).date()))
+
+    st.subheader("6 · Staffing per day")
     c1, c2 = st.columns(2)
     day_min = c1.number_input("Min day staff", 0, 50, defaults.day_min)
     day_max = c2.number_input("Max day staff", 1, 50, defaults.day_max)
@@ -147,7 +180,7 @@ with st.sidebar:
     night_min = c3.number_input("Min nights/day", 0, 10, defaults.night_min)
     night_max = c4.number_input("Max nights/day (overlap)", 1, 10, defaults.night_max)
 
-    st.subheader("6 · Rules")
+    st.subheader("7 · Rules")
     shifts = st.number_input("Shifts per employee (exact)", 1, 31,
                              defaults.shifts_per_employee)
     c5, c6 = st.columns(2)
@@ -195,6 +228,7 @@ def make_settings() -> sch.ScheduleSettings:
         year=int(year), month=int(month),
         employees=employees, night_team=night_team,
         am_team=am_team, am_days=tuple(am_days),
+        leave=leave_rows,
         day_min=int(day_min), day_max=int(day_max),
         night_min=int(night_min), night_max=int(night_max),
         shifts_per_employee=int(shifts),
@@ -227,25 +261,30 @@ def grid_dataframe(S: sch.ScheduleSettings, grid: list[list[str]]) -> pd.DataFra
 
 def color_cell(val: str) -> str:
     """Mirror the openpyxl fills so the web grid matches the Excel exactly."""
-    code = {"D": sch.DAY, "N": sch.NIGHT, "OFF": sch.OFF, "AM": sch.AM}.get(val)
+    code = {"D": sch.DAY, "N": sch.NIGHT, "V": sch.LEAVE, "": sch.OFF,
+            "AM": sch.AM}.get(val)
     bg = sch.WEB_COLORS.get(code, "#FFFFFF")
     return f"background-color: {bg}; text-align: center; color: #13233B; font-weight: 600;"
 
 
 def color_result(val: str) -> str:
-    """PASS/FAIL cell color, reusing the grid's green/pink so the views agree."""
+    """PASS/FAIL cell color, reusing the grid's green/red so the views agree.
+    FAIL uses the LEAVE red: OFF is now a blank white cell, so borrowing it
+    would silently blank every FAIL badge."""
     if val == "PASS":
         return f"background-color: {sch.WEB_COLORS[sch.DAY]}; color: #13233B; font-weight: 600;"
     if val == "FAIL":
-        return f"background-color: {sch.WEB_COLORS[sch.OFF]}; color: #13233B; font-weight: 600;"
+        return f"background-color: {sch.WEB_COLORS[sch.LEAVE]}; color: #13233B; font-weight: 600;"
     return ""
 
 
-def legend(show_am: bool = False) -> None:
+def legend(show_am: bool = False, show_leave: bool = False) -> None:
     """A compact key whose swatches are the EXACT grid colors (WEB_COLORS)."""
     items = [(sch.WEB_COLORS[sch.DAY], "D", "Day"),
              (sch.WEB_COLORS[sch.NIGHT], "N", "Night"),
-             (sch.WEB_COLORS[sch.OFF], "OFF", "Off")]
+             (sch.WEB_COLORS[sch.OFF], "", "Off")]
+    if show_leave:
+        items.append((sch.WEB_COLORS[sch.LEAVE], "V", "Leave"))
     if show_am:
         items.append((sch.WEB_COLORS[sch.AM], "AM", "AM"))
     html = ['<div class="legend">']
@@ -444,7 +483,7 @@ if "result" in st.session_state:
 
     # ======================= ROSTER (the hero) ==============================
     with tab_roster:
-        legend(show_am=bool(S.am_team))
+        legend(show_am=bool(S.am_team), show_leave=bool(S.leave))
         render_grid(S, R["grid"])
         st.divider()
         st.markdown("##### Daily coverage")
@@ -478,7 +517,8 @@ if "result" in st.session_state:
         loads = sch.employee_loads(S, R["grid"])
         fair_df = pd.DataFrame([{
             "Employee": ld["name"] + (" ∗" if ld["night_member"] else ""),
-            "Total": ld["total"], "Day": ld["day"], "Night": ld["night"],
+            "Total": ld["total"], "Leave": ld["leave"], "Target": ld["target"],
+            "Day": ld["day"], "Night": ld["night"],
             "Fri/Sat": ld["weekend"], "Weekends off": ld["weekends_off"],
             "Overlaps": ld["overlaps"], "Max-runs": ld["max_runs"],
         } for ld in loads])

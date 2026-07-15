@@ -105,6 +105,44 @@ thin front-end over the engine.
   Every HARD rule still holds, so that is a contract-compliant soft FAIL, **not** the
   OPTIMAL-but-FAIL landmine. Keep alt-on configs out of any all-PASS smoke assertion the way
   the INFEASIBLE and tight soft-fail configs are kept out.
+- **Leave (`ScheduleSettings.leave`) hard-blocks days and prorates targets.** Ranges are
+  `(name, from, to)` inclusive date tuples; `leave_day_sets()` / `shift_targets()` /
+  `available_segments()` are the single derivation all four stages share. Leave days are
+  hard-blocked (`work == 0`) and shown as `V` (`LEAVE`); **grid extraction emits `LEAVE`
+  only inside the `work == 0` branch** — a regressed hard-block surfaces as D/N and the
+  *"Leave days are honored"* check FAILs loudly. Never label from settings alone: that
+  would make the check score the labeling path instead of the constraint. **All five run
+  rules apply per available segment** (the free stretches between leave blocks): max-off
+  windows are enumerated per segment, min-work/min-off re-encode with segment edges playing
+  the month-edge role, and a **singleton segment is forced OFF** (`work == 0`) — the
+  validator mirrors this by exempting a whole-segment off-run shorter than `min_consec_off`
+  and skipping target-0 employees (leave ≥ target), who are also exempt from the
+  alternating-weekends chain **and** check; chain pairs touching a fully-leave weekend are
+  skipped identically on both sides. **Night arithmetic uses summed targets:**
+  `expected_double_nights()` and the preflight capacity checks sum `shift_targets()` over
+  the team (identical to `16·N` with no leave), so with the default 2-member team **team
+  leave-days beyond `32 − days` trip the night floor** (1 day of slack in a 31-day month,
+  2 in a 30-day month, 4 in February) — never "any night-team leave is infeasible": short
+  team leave inside the slack is feasible and must not be blocked. Leave that passes the
+  floor can still be provably infeasible on run caps; the **pinned-crew preflight guard**
+  catches that (a pool whose availability sits AT its floor for longer than its run cap
+  forces someone over the cap — e.g. one member of the default team on 4 consecutive
+  February leave days). **Weighted fairness is gated on leave:** with leave configured,
+  G2/G3 switch to division-free target-weighted deviations (`T·x_e − tgt_e·X` per pool,
+  via the **signed** gap helper — `minmax_gap`'s `[0, ub]` bounds go infeasible on negative
+  deviations) and the raw G1/G4/no-full-weekend terms are scaled by the matching pool
+  target sum so the four goals stay commensurate; `validate()` scores the same weighted
+  quantity per pool (`spread ≤ fair_tol_* × T_pool`, F3 tested per pool since the two
+  pools' T differ). With `leave=[]` every branch takes the legacy path and the model/grid
+  are bit-identical to pristine main — verify by grid diff, not by eye. AM staff cannot
+  take leave in v1 (preflight rejects the name) and their Hours cell stays blank.
+- **OFF renders blank; nothing may borrow its old red.** `CELL_LABEL[OFF] = ""`,
+  `CELL_FILL[OFF] = None`, `WEB_COLORS[OFF] = "#FFFFFF"`; the FFC7CE red now belongs to
+  `LEAVE` (`FILL_LEAVE`). Anything styling FAIL/error states must point at the leave red
+  (app.py's `color_result` does), never `WEB_COLORS[OFF]`. The Excel stat columns
+  (Total/Day/Night/Fri-Sat/Hours) are live COUNTIF formulas over the day cells — they
+  recount hand edits, while the Summary sheet and app validation reflect only the generated
+  roster; `hours_per_shift` (default 12) lives in `ScheduleSettings`, never hard-coded.
 - **Two places to update when adding a rule:** the constraint in `build_and_solve()` **and**
   an independent check in `validate()`. A rule that isn't in the validator isn't trusted.
   For a **fairness** goal, the objective term and the validator check must score the **same
