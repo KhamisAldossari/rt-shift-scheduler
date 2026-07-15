@@ -937,6 +937,9 @@ def screen_export() -> None:
                 next_cfg["month"], next_cfg["year"] = 1, next_cfg["year"] + 1
             else:
                 next_cfg["month"] += 1
+            # Leave is month-anchored -- last month's ranges can never be
+            # valid in the advanced month, so they don't survive.
+            next_cfg["leave"] = []
             st.session_state.setup = next_cfg
             st.session_state.pop("result", None)
             st.session_state.pop("gen_failed", None)
