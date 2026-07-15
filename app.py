@@ -17,15 +17,17 @@ export a month's roster unaided:
                       and exactly one accent primary action.
 
   Step 1 - Setup    : builds ScheduleSettings -- month, staff editor, night-team
-                      picker, AM staff editor + AM working days, and one collapsed
-                      "Adjust rules" expander (staffing bands, shifts/employee,
-                      run-length caps, the alternating-weekends toggle, and a
-                      plain-language "Scheduling effort" level -- raising it scales
-                      the engine's deterministic search budget AND its wall-clock
-                      safety net together, so the net never binds first). Duplicate
-                      staff names are flagged inline and block Continue -- the
-                      engine's preflight doesn't check for those, so this screen
-                      does. Primary: Continue.
+                      picker, AM staff editor + AM working days, a leave editor
+                      (per-person vacation ranges inside the month; the engine
+                      blocks those days and prorates the shift target), and one
+                      collapsed "Adjust rules" expander (staffing bands,
+                      shifts/employee, run-length caps, the alternating-weekends
+                      toggle, and a plain-language "Scheduling effort" level --
+                      raising it scales the engine's deterministic search budget
+                      AND its wall-clock safety net together, so the net never
+                      binds first). Duplicate staff names are flagged inline and
+                      block Continue -- the engine's preflight doesn't check for
+                      those, so this screen does. Primary: Continue.
   Step 2 - Check    : runs preflight automatically. Problems render calmly as
                       message + suggestion; a clean setup shows a plain recap.
                       If a roster already exists for these exact settings (e.g.
@@ -55,10 +57,10 @@ export a month's roster unaided:
 Wizard state lives in st.session_state: `step` (1-4) and `setup` (a plain, non-
 widget dict that mirrors every step-1 input so custom entries survive Back
 navigation -- widget keys are garbage-collected when their step isn't on screen).
-The staff and AM data_editor widgets are seeded from a DataFrame that's rebuilt
-only when (re)entering step 1, not on every rerun -- rebuilding it from the
-mirror every rerun would change the seed after each edit and flip the editor's
-widget identity, silently reverting the second of two consecutive edits.
+The staff, AM, and leave data_editor widgets are seeded from DataFrames that are
+rebuilt only when (re)entering step 1, not on every rerun -- rebuilding a seed
+from the mirror every rerun would change it after each edit and flip the
+editor's widget identity, silently reverting the second of two consecutive edits.
 A generated `result` snapshots the settings signature it was built from and is
 dropped when the setup changes, so steps 3-4 never show a stale roster.
 
@@ -77,6 +79,7 @@ from __future__ import annotations
 
 import calendar
 import copy
+import datetime
 
 import pandas as pd
 import streamlit as st
@@ -177,6 +180,7 @@ def _init_setup() -> dict:
         "night_team": list(defaults.night_team),
         "am_team": list(defaults.am_team),
         "am_days": list(defaults.am_days),
+        "leave": list(defaults.leave),
         "day_min": defaults.day_min,
         "day_max": defaults.day_max,
         "night_min": defaults.night_min,
@@ -193,7 +197,7 @@ def _init_setup() -> dict:
 
 
 def _seed_editors() -> None:
-    """(Re)build the two data_editor seed frames from the setup mirror.
+    """(Re)build the three data_editor seed frames from the setup mirror.
 
     Called only when (re)entering step 1 -- NOT on every step-1 rerun -- so the
     same DataFrame instance backs each editor across reruns while the user
@@ -206,6 +210,10 @@ def _seed_editors() -> None:
         {"Employee": pd.Series(list(cfg["employees"]), dtype="object")})
     st.session_state["_am_seed"] = pd.DataFrame(
         {"AM staff": pd.Series(list(cfg["am_team"]), dtype="object")})
+    st.session_state["_leave_seed"] = pd.DataFrame(
+        {"Employee": pd.Series([r[0] for r in cfg["leave"]], dtype="object"),
+         "From": pd.Series([r[1] for r in cfg["leave"]], dtype="datetime64[ns]"),
+         "To": pd.Series([r[2] for r in cfg["leave"]], dtype="datetime64[ns]")})
 
 
 if "step" not in st.session_state:
@@ -218,7 +226,8 @@ if "_emp_seed" not in st.session_state:
 
 def go_to(step: int) -> None:
     """Switch screens. Leaving for Setup clears any transient solve outcome
-    and re-seeds the staff/AM editors from the (possibly just-updated) mirror."""
+    and re-seeds the staff/AM/leave editors from the (possibly just-updated)
+    mirror."""
     st.session_state.step = step
     if step == 1:
         st.session_state.pop("gen_failed", None)
@@ -239,6 +248,7 @@ def make_settings(cfg: dict) -> sch.ScheduleSettings:
         year=int(cfg["year"]), month=int(cfg["month"]),
         employees=cfg["employees"], night_team=cfg["night_team"],
         am_team=cfg["am_team"], am_days=tuple(cfg["am_days"]),
+        leave=cfg["leave"],
         day_min=int(cfg["day_min"]), day_max=int(cfg["day_max"]),
         night_min=int(cfg["night_min"]), night_max=int(cfg["night_max"]),
         shifts_per_employee=int(cfg["shifts"]),
@@ -280,25 +290,30 @@ def grid_dataframe(S: sch.ScheduleSettings, grid: list[list[str]]) -> pd.DataFra
 
 def color_cell(val: str) -> str:
     """Mirror the openpyxl fills so the web grid matches the Excel exactly."""
-    code = {"D": sch.DAY, "N": sch.NIGHT, "OFF": sch.OFF, "AM": sch.AM}.get(val)
+    code = {"D": sch.DAY, "N": sch.NIGHT, "V": sch.LEAVE, "": sch.OFF,
+            "AM": sch.AM}.get(val)
     bg = sch.WEB_COLORS.get(code, "#FFFFFF")
     return f"background-color: {bg}; text-align: center; color: #1C2B2A; font-weight: 600;"
 
 
 def color_result(val: str) -> str:
-    """PASS/FAIL cell color, reusing the grid's green/pink so the views agree."""
+    """PASS/FAIL cell color, reusing the grid's green/red so the views agree.
+    FAIL uses the LEAVE red: OFF is now a blank white cell, so borrowing it
+    would silently blank every FAIL badge."""
     if val == "PASS":
         return f"background-color: {sch.WEB_COLORS[sch.DAY]}; color: #1C2B2A; font-weight: 600;"
     if val == "FAIL":
-        return f"background-color: {sch.WEB_COLORS[sch.OFF]}; color: #1C2B2A; font-weight: 600;"
+        return f"background-color: {sch.WEB_COLORS[sch.LEAVE]}; color: #1C2B2A; font-weight: 600;"
     return ""
 
 
-def legend(show_am: bool = False) -> None:
+def legend(show_am: bool = False, show_leave: bool = False) -> None:
     """A compact key whose swatches are the EXACT grid colors (WEB_COLORS)."""
     items = [(sch.WEB_COLORS[sch.DAY], "D", "Day"),
              (sch.WEB_COLORS[sch.NIGHT], "N", "Night"),
-             (sch.WEB_COLORS[sch.OFF], "OFF", "Off")]
+             (sch.WEB_COLORS[sch.OFF], "", "Off")]
+    if show_leave:
+        items.append((sch.WEB_COLORS[sch.LEAVE], "V", "Leave"))
     if show_am:
         items.append((sch.WEB_COLORS[sch.AM], "AM", "AM"))
     html = ['<div class="legend">']
@@ -457,7 +472,8 @@ def employee_table(S: sch.ScheduleSettings, grid: list[list[str]]) -> None:
     loads = sch.employee_loads(S, grid)
     df = pd.DataFrame([{
         "Employee": ld["name"] + (" ∗" if ld["night_member"] else ""),
-        "Total": ld["total"], "Day": ld["day"], "Night": ld["night"],
+        "Total": ld["total"], "Leave": ld["leave"], "Target": ld["target"],
+        "Day": ld["day"], "Night": ld["night"],
         "Fri/Sat": ld["weekend"], "Weekends off": ld["weekends_off"],
         "Overlaps": ld["overlaps"], "Max-runs": ld["max_runs"],
     } for ld in loads])
@@ -475,6 +491,9 @@ def recap(S: sch.ScheduleSettings) -> None:
     st.markdown(f"- Night team (nights only): {', '.join(S.night_team) or '(none selected)'}")
     if S.am_team:
         st.markdown(f"- AM shift: {', '.join(S.am_team)} on {', '.join(S.am_days)}")
+    if S.leave:
+        st.markdown(f"- Leave: {len(S.leave)} range(s) entered — those days are "
+                    f"blocked and each person's shift target drops to match")
     st.markdown(f"- Each day: {S.day_min}–{S.day_max} day staff, "
                 f"{S.night_min}–{S.night_max} night staff")
     st.markdown(f"- {S.shifts_per_employee} shifts per person; at most "
@@ -582,6 +601,37 @@ def screen_setup() -> None:
             default=[d for d in cfg["am_days"] if d in sch.WEEKDAY_NAMES], key="w_amdays",
             help="The weekdays AM staff work every week (default Sun–Thu).")
 
+        # -- Leave ----------------------------------------------------------
+        st.markdown('<div class="kicker">Leave</div>', unsafe_allow_html=True)
+        st.caption("Vacation inside the month: those days are blocked ('V') and "
+                   "the person's shift target drops by one per leave day. One row "
+                   "per range; several rows per person are fine. Rows missing a "
+                   "name or a date are ignored.")
+        month_first = datetime.date(int(year), int(month), 1)
+        month_last = datetime.date(int(year), int(month),
+                                   calendar.monthrange(int(year), int(month))[1])
+        leave_df = st.data_editor(
+            st.session_state["_leave_seed"],
+            num_rows="dynamic", width="stretch", hide_index=True, key="w_leave",
+            column_config={
+                "Employee": st.column_config.SelectboxColumn(
+                    "Employee", options=employees, width="medium",
+                    help="Scheduled staff only — AM staff cannot take rostered leave."),
+                "From": st.column_config.DateColumn(
+                    "From", min_value=month_first, max_value=month_last),
+                "To": st.column_config.DateColumn(
+                    "To", min_value=month_first, max_value=month_last),
+            })
+        # Collect complete rows only (name + both dates); every rule-level check
+        # -- unknown names, reversed or out-of-month ranges -- stays in preflight.
+        leave = []
+        for _, lrow in leave_df.iterrows():
+            lname, d_from, d_to = lrow.get("Employee"), lrow.get("From"), lrow.get("To")
+            if pd.isna(lname) or not str(lname).strip() or pd.isna(d_from) or pd.isna(d_to):
+                continue
+            leave.append((str(lname).strip(),
+                          pd.Timestamp(d_from).date(), pd.Timestamp(d_to).date()))
+
         # -- Adjust rules (collapsed; pre-filled from ScheduleSettings) ----
         with st.expander("Adjust rules"):
             st.caption("Pre-filled with the department defaults. Change these only if "
@@ -644,6 +694,7 @@ def screen_setup() -> None:
             "year": int(year), "month": int(month),
             "employees": employees, "night_team": night_team,
             "am_team": am_team, "am_days": list(am_days),
+            "leave": leave,
             "day_min": int(day_min), "day_max": int(day_max),
             "night_min": int(night_min), "night_max": int(night_max),
             "shifts": int(shifts),
@@ -787,7 +838,7 @@ def screen_roster() -> None:
 
         # -- The color grid: the visual hero, with the legend -----------
         st.markdown("##### Roster grid")
-        legend(show_am=bool(S.am_team))
+        legend(show_am=bool(S.am_team), show_leave=bool(S.leave))
         render_grid(S, R["grid"])
 
         st.divider()
@@ -886,6 +937,9 @@ def screen_export() -> None:
                 next_cfg["month"], next_cfg["year"] = 1, next_cfg["year"] + 1
             else:
                 next_cfg["month"] += 1
+            # Leave is month-anchored -- last month's ranges can never be
+            # valid in the advanced month, so they don't survive.
+            next_cfg["leave"] = []
             st.session_state.setup = next_cfg
             st.session_state.pop("result", None)
             st.session_state.pop("gen_failed", None)

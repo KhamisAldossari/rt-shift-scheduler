@@ -18,6 +18,9 @@ nothing about the month, the staff, or the rule values is hard-coded.
 
 POLICY (this revision):
   * Every employee works EXACTLY `shifts_per_employee` shifts for the month.
+  * Leave (vacation) date ranges hard-block those days -- shown as "V" in the
+    grid -- and prorate that employee's exact total to max(0, shifts - leave
+    days). Run rules apply within each free stretch between leave blocks.
   * Nights are covered under one of two selectable rotation modes:
       - "fixed_team": a dedicated night team of ANY size N works nights ONLY and
         is the only group eligible for nights. Coverage is the band
@@ -57,6 +60,9 @@ from openpyxl.utils import get_column_letter
 
 # Shift codes used throughout.
 DAY, NIGHT, OFF = "D", "N", "O"
+# Leave (vacation): configured per ScheduleSettings.leave, hard-blocked in the
+# model, and labelled "V" in the grid so both views render it from one artifact.
+LEAVE = "V"
 # AM staff work a fixed weekly pattern and live entirely outside the solver (see
 # am_rows): they are appended to the roster, never scheduled, counted, or validated.
 AM = "AM"
@@ -99,6 +105,13 @@ class ScheduleSettings:
     am_team: list[str] = field(default_factory=list)
     am_days: tuple = ("Sun", "Mon", "Tue", "Wed", "Thu")
 
+    # --- Leave (vacation) ----------------------------------------------------
+    # One row per leave range: (employee name, first day, last day), dates
+    # inclusive, within the chosen month. Multiple rows per employee allowed.
+    # Empty by default: with no leave the model is byte-identical to the
+    # pre-feature engine. AM staff cannot take rostered leave (preflight rejects).
+    leave: list[tuple[str, datetime.date, datetime.date]] = field(default_factory=list)
+
     # --- Staffing bands -----------------------------------------------------
     day_min: int = 2                                # day staff required per day
     day_max: int = 4
@@ -107,6 +120,7 @@ class ScheduleSettings:
 
     # --- Workload -----------------------------------------------------------
     shifts_per_employee: int = 16                   # EXACT monthly total
+    hours_per_shift: int = 12                       # one shift = 12 h (Hours col)
 
     # --- Run lengths --------------------------------------------------------
     max_consec_work: int = 4                        # day-shift / working run cap
@@ -234,11 +248,68 @@ def is_night_member(settings: ScheduleSettings, e: int) -> bool:
             and settings.employees[e] in settings.night_team)
 
 
+def leave_day_sets(settings: ScheduleSettings) -> list[set[int]]:
+    """Per-employee 0-based day indices on leave (union of the configured ranges).
+
+    Overlapping ranges collapse; each range is clamped to the month; unknown
+    names are skipped. Clamping keeps this total (defense in depth) --
+    preflight() is the authority that rejects out-of-month or malformed ranges.
+    date -> index: (date - first_of_month).days.
+    """
+    S = settings
+    first = datetime.date(S.year, S.month, 1)
+    out: list[set[int]] = [set() for _ in S.employees]
+    index = {name: i for i, name in enumerate(S.employees)}
+    for name, d0, d1 in S.leave:
+        if name not in index:
+            continue
+        if isinstance(d0, datetime.datetime):
+            d0 = d0.date()
+        if isinstance(d1, datetime.datetime):
+            d1 = d1.date()
+        a, b = (d0 - first).days, (d1 - first).days
+        out[index[name]].update(range(max(0, a), min(S.days - 1, b) + 1))
+    return out
+
+
+def shift_targets(settings: ScheduleSettings) -> list[int]:
+    """Per-employee exact monthly total: shifts_per_employee prorated by leave."""
+    lv = leave_day_sets(settings)
+    return [max(0, settings.shifts_per_employee - len(lv[e]))
+            for e in range(len(settings.employees))]
+
+
+def available_segments(settings: ScheduleSettings) -> list[list[tuple[int, int]]]:
+    """Per-employee maximal (start, end) inclusive runs of non-leave day indices.
+
+    The run-length rules apply WITHIN each segment (leave days belong to no
+    run); with no leave every employee has the single segment (0, days-1), which
+    makes the per-segment encodings collapse to the pre-feature constraints.
+    """
+    S = settings
+    lv = leave_day_sets(S)
+    segs_all: list[list[tuple[int, int]]] = []
+    for e in range(len(S.employees)):
+        segs, start = [], None
+        for d in range(S.days):
+            if d in lv[e]:
+                if start is not None:
+                    segs.append((start, d - 1))
+                    start = None
+            elif start is None:
+                start = d
+        if start is not None:
+            segs.append((start, S.days - 1))
+        segs_all.append(segs)
+    return segs_all
+
+
 def expected_double_nights(settings: ScheduleSettings) -> int:
     """Forced night-overlap (extra nights above the floor), given exact totals.
 
-    A nights-only team of ANY size N, each working `shifts_per_employee`, places
-    a fixed N * shifts night-shifts. With >= night_min covered every day, the
+    A nights-only team of ANY size N, each working an exact target (their
+    `shifts_per_employee` prorated by leave), places a fixed summed-target
+    number of night-shifts. With >= night_min covered every day, the
     surplus above the floor -- max(0, total_nights - night_min*days) -- must land
     as overlap (extra nights stacked onto some days). This is the minimum the
     arithmetic forces; nothing more. The validator checks the realised overlap
@@ -248,8 +319,8 @@ def expected_double_nights(settings: ScheduleSettings) -> int:
     """
     if settings.is_rotate or not settings.night_team_nights_only:
         return 0
-    n_night = len(night_eligible_indices(settings))
-    total_nights = settings.shifts_per_employee * n_night
+    tgt = shift_targets(settings)
+    total_nights = sum(tgt[e] for e in night_eligible_indices(settings))
     return max(0, total_nights - settings.night_min * settings.days)
 
 
@@ -257,11 +328,13 @@ def roster_caption(settings: ScheduleSettings) -> str:
     """One-line description of the roster, shared by Excel and the CLI."""
     S = settings
     head = f"Roster: {S.month_label} ({S.days} days)."
+    n_leave = sum(1 for lv in leave_day_sets(S) if lv)
+    tail = f"; {n_leave} staff on leave." if n_leave else "."
     if S.is_rotate:
-        return f"{head} All staff rotate nights."
+        return f"{head} All staff rotate nights{tail}"
     names = ", ".join(S.night_team) if S.night_team else "(none)"
     only = " (nights only)" if S.night_team_nights_only else ""
-    return f"{head} Night team: {names}{only}."
+    return f"{head} Night team: {names}{only}{tail}"
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +369,37 @@ class Problem:
 
 def _ceil(a: int, b: int) -> int:
     return -(-a // b)
+
+
+def _segment_work_counts(length: int, max_work: int, max_off: int,
+                         min_run: int) -> set[int]:
+    """Feasible work totals for ONE free stretch of `length` days.
+
+    Exact enumeration of the run rules inside a segment: work and off blocks
+    alternate, work blocks in [min_run, max_work], off blocks in
+    [min_run, max_off]. A stretch too short for any legal block (a singleton
+    between leave/month edges) is forced fully off -> {0}, mirroring the
+    solver's singleton rule and the validator's whole-segment exemption.
+    """
+    if length < min_run:
+        return {0}
+    # states[(filled, last_block_kind)] -> set of reachable work totals.
+    states: dict[tuple[int, str | None], set[int]] = {(0, None): {0}}
+    for pos in range(length):
+        for last in (None, "w", "o"):
+            reached = states.get((pos, last))
+            if not reached:
+                continue
+            if last != "w":
+                for blk in range(min_run, max_work + 1):
+                    if pos + blk <= length:
+                        states.setdefault((pos + blk, "w"), set()).update(
+                            c + blk for c in reached)
+            if last != "o":
+                for blk in range(min_run, max_off + 1):
+                    if pos + blk <= length:
+                        states.setdefault((pos + blk, "o"), set()).update(reached)
+    return states.get((length, "w"), set()) | states.get((length, "o"), set())
 
 
 def preflight(settings: ScheduleSettings) -> list[Problem]:
@@ -411,9 +515,134 @@ def preflight(settings: ScheduleSettings) -> list[Problem]:
                     f"any weekend, below the {S.day_min + S.night_min} day+night daily floor.",
                     "Turn off alternating weekends, lower the daily minimums, or add staff."))
 
+    # --- Leave (vacation): input validation, then exact necessities ---------
+    # Input first: preflight is the authority on malformed ranges (the helpers
+    # clamp defensively but never reject). AM staff cannot take rostered leave.
+    if S.leave:
+        first_day = datetime.date(S.year, S.month, 1)
+        last_day = datetime.date(S.year, S.month, days)
+        for name, d0, d1 in S.leave:
+            if isinstance(d0, datetime.datetime):
+                d0 = d0.date()
+            if isinstance(d1, datetime.datetime):
+                d1 = d1.date()
+            if name in S.am_team:
+                problems.append(Problem(
+                    f"Leave entry names {name}, who is AM staff.",
+                    "AM staff cannot take rostered leave in this version -- remove "
+                    "the row, or move them into the scheduled employee list first."))
+            elif name not in S.employees:
+                problems.append(Problem(
+                    f"Leave entry names {name}, who is not in the employee list.",
+                    "Pick names from the employee list; AM staff cannot take "
+                    "rostered leave in this version."))
+            if d0 > d1:
+                problems.append(Problem(
+                    f"Leave for {name} starts after it ends ({d0} > {d1}).",
+                    "Swap the dates so the range runs start to end."))
+            elif d0 < first_day or d1 > last_day:
+                problems.append(Problem(
+                    f"Leave for {name} runs outside {S.month_label}.",
+                    "Keep each range inside the month; split cross-month leave "
+                    "per month."))
+
+    lv = leave_day_sets(S)
+    tgt = shift_targets(S)
+    has_leave = any(lv)
+    if has_leave:
+        # Every check below is an exact necessity -- never a heuristic that
+        # could false-block a feasible month (preflight hard-stops the app).
+        def avail(pool, d):
+            """Members of `pool` free on day d (not on leave, target > 0)."""
+            return sum(1 for e in pool if tgt[e] > 0 and d not in lv[e])
+
+        elig_pool = night_eligible_indices(S)
+        day_pool = day_capable_indices(S)
+        pools_disjoint = (not S.is_rotate) and S.night_team_nights_only
+
+        # Per-day availability floors. Nights are workable only by the eligible
+        # pool in EVERY mode, so its floor is always necessary; the day side is
+        # per-pool when the pools are disjoint (nights-only team), else shared.
+        def floor_problem(pool, floor, what):
+            short = [d for d in range(days) if avail(pool, d) < floor]
+            if short:
+                dates = ", ".join(f"D{d + 1}" for d in short[:4]) + (
+                    "..." if len(short) > 4 else "")
+                problems.append(Problem(
+                    f"Leave leaves fewer than {floor} {what} available on {dates}.",
+                    "Stagger the overlapping leave or lower the daily minimums."))
+
+        floor_problem(elig_pool, S.night_min, "night-eligible staff")
+        if pools_disjoint:
+            floor_problem(day_pool, S.day_min, "day staff")
+        else:
+            floor_problem(list(range(n_emp)), S.day_min + S.night_min,
+                          "staff (day+night floor)")
+
+        # Pinned-crew stretches: on days where a pool's availability EQUALS its
+        # floor, every free member must work; anyone free through such a stretch
+        # for longer than the pool's run cap is forced over the cap -- provably
+        # infeasible even though the capacity sums and per-day floors pass.
+        def pinned_problem(pool, floor, cap, what):
+            if floor <= 0:
+                return
+            d = 0
+            while d < days:
+                if avail(pool, d) != floor:
+                    d += 1
+                    continue
+                a = d
+                while d < days and avail(pool, d) == floor:
+                    d += 1
+                b = d - 1                       # maximal pinned run [a, b]
+                for e in pool:
+                    if tgt[e] <= 0:
+                        continue
+                    run = best = 0
+                    for x in range(a, b + 1):
+                        run = 0 if x in lv[e] else run + 1
+                        best = max(best, run)
+                    if best > cap:
+                        problems.append(Problem(
+                            f"Leave pins the {what} crew at its minimum on "
+                            f"D{a + 1}-D{b + 1}, forcing {S.employees[e]} to work "
+                            f"more than {cap} days straight.",
+                            "Shorten or split the leave, or add cover for those days."))
+
+        pinned_problem(elig_pool, S.night_min, S.max_consec_night, "night")
+        if pools_disjoint:
+            pinned_problem(day_pool, S.day_min, S.max_consec_work, "day")
+        else:
+            pinned_problem(list(range(n_emp)), S.day_min + S.night_min,
+                           S.max_consec_work, "day+night")
+
+        # Per-employee pattern guard for leave-takers: an exact per-segment
+        # enumeration (the contiguous pattern check below would falsely block
+        # feasible split months). Each free stretch admits a set of work totals;
+        # the prorated target must be reachable as a sum across stretches.
+        segs_all = available_segments(S)
+        for e in range(n_emp):
+            if not lv[e] or tgt[e] == 0:
+                continue
+            cap = (S.max_consec_night
+                   if not S.is_rotate and S.night_team_nights_only
+                   and S.employees[e] in S.night_team
+                   else S.max_consec_work)
+            reach = {0}
+            for (a, b) in segs_all[e]:
+                counts = _segment_work_counts(b - a + 1, cap, S.max_consec_off,
+                                              S.min_consec_work)
+                reach = {r + c for r in reach for c in counts}
+            if tgt[e] not in reach:
+                problems.append(Problem(
+                    f"{S.employees[e]}'s leave splits the month into stretches "
+                    f"that cannot hold exactly {tgt[e]} shifts under the run rules.",
+                    "Shift or split the leave, or change shifts/employee -- the "
+                    "free stretches can't fit that many shifts in legal blocks."))
+
     # --- Mode B: everyone rotates nights -----------------------------------
     if S.is_rotate:
-        total_shifts = w * n_emp
+        total_shifts = sum(tgt)             # == w * n_emp when no leave
         floor_need = (S.day_min + S.night_min) * days
         ceil_cap = (S.day_max + S.night_max) * days
         if total_shifts < floor_need:
@@ -426,9 +655,12 @@ def preflight(settings: ScheduleSettings) -> list[Problem]:
                 f"{total_shifts} total shifts exceed the {ceil_cap} the daily maxima "
                 f"allow (<= {S.day_max + S.night_max}/day).",
                 "Raise max day/night staffing, remove staff, or lower shifts/employee."))
-        p = pattern_problem("Roster pattern", w, S.max_consec_work, S.max_consec_off)
-        if p:
-            problems.append(p)
+        # The contiguous pattern check speaks for leave-free employees only;
+        # leave-takers were covered by the exact per-segment guard above.
+        if not has_leave or any(not lv[i] for i in range(n_emp)):
+            p = pattern_problem("Roster pattern", w, S.max_consec_work, S.max_consec_off)
+            if p:
+                problems.append(p)
         return problems
 
     # --- Mode A: fixed night team ------------------------------------------
@@ -442,14 +674,25 @@ def preflight(settings: ScheduleSettings) -> list[Problem]:
             "No night-team members selected.",
             "Select at least 1 employee for the night team (any size)."))
 
-    # Night coverage capacity (nights-only team).
-    total_nights = w * n_night if S.night_team_nights_only else None
+    # Night coverage capacity (nights-only team). Supply is the summed
+    # per-member TARGET (prorated by leave) -- identical to w * n_night when no
+    # leave; a name not in the employee list still counts w so the message
+    # matches the pre-leave arithmetic (the subset check above already fires).
+    team_idx = [S.employees.index(nm) for nm in S.night_team if nm in S.employees]
+    total_nights = (sum(tgt[i] for i in team_idx) + w * (n_night - len(team_idx))
+                    if S.night_team_nights_only else None)
     if S.night_team_nights_only and n_night >= 1:
         if total_nights < S.night_min * days:
+            if any(lv[i] for i in team_idx):
+                sugg = ("Move a day-team member into the night team for this "
+                        "month, or schedule the leave in a month with different "
+                        "cover.")
+            else:
+                sugg = "Lower min nights/day, or give the night team more shifts."
             problems.append(Problem(
                 f"Night team supplies {total_nights} nights, but >= {S.night_min}/day "
                 f"needs {S.night_min * days}.",
-                f"Lower min nights/day, or give the night team more shifts."))
+                sugg))
         if total_nights > S.night_max * days:
             need = _ceil(total_nights, days)
             problems.append(Problem(
@@ -458,8 +701,8 @@ def preflight(settings: ScheduleSettings) -> list[Problem]:
                 f"Raise max nights/day to {need}, add a night-team member, or shrink "
                 f"the night-team workload."))
 
-    # Day coverage capacity.
-    day_shifts = w * n_emp - (total_nights if total_nights is not None else 0)
+    # Day coverage capacity (summed targets; == w * n_emp - nights when no leave).
+    day_shifts = sum(tgt) - (total_nights if total_nights is not None else 0)
     if day_shifts < S.day_min * days:
         problems.append(Problem(
             f"Only {day_shifts} day-shifts are available, but >= {S.day_min}/day "
@@ -472,14 +715,18 @@ def preflight(settings: ScheduleSettings) -> list[Problem]:
             f"allows {S.day_max * days}.",
             f"Raise max day staffing to {need}, or remove a day-team member."))
 
-    # Per-employee run-length pattern feasibility.
-    p = pattern_problem("Day-team pattern", w, S.max_consec_work, S.max_consec_off)
-    if p:
-        problems.append(p)
-    if S.night_team_nights_only and n_night >= 1:
-        p = pattern_problem("Night-team pattern", w, S.max_consec_night, S.max_consec_off)
+    # Per-employee run-length pattern feasibility. The contiguous check speaks
+    # for leave-free pool members only; leave-takers were covered by the exact
+    # per-segment guard above.
+    if not has_leave or any(not lv[i] for i in day_capable_indices(S)):
+        p = pattern_problem("Day-team pattern", w, S.max_consec_work, S.max_consec_off)
         if p:
             problems.append(p)
+    if S.night_team_nights_only and n_night >= 1:
+        if not has_leave or any(not lv[i] for i in team_idx):
+            p = pattern_problem("Night-team pattern", w, S.max_consec_night, S.max_consec_off)
+            if p:
+                problems.append(p)
 
     return problems
 
@@ -500,6 +747,14 @@ def relaxation_hints(settings: ScheduleSettings) -> list[str]:
         hints.append(
             "Turn off alternating weekends -- forcing every employee off on every "
             "other full weekend can over-constrain a tight month.")
+    if S.leave:
+        hints.append(
+            "Stagger overlapping leave -- several staff off the same day tightens "
+            "the daily floors.")
+        if S.alternating_weekends:
+            hints.append(
+                "Leave overlapping weekends constrains the weekend alternation -- "
+                "turn the toggle off for this month or shift the leave.")
     return hints
 
 
@@ -509,7 +764,7 @@ def relaxation_hints(settings: ScheduleSettings) -> list[str]:
 
 @dataclass
 class Solution:
-    grid: list[list[str]]      # grid[employee][day] in {D, N, O}
+    grid: list[list[str]]      # grid[employee][day] in {D, N, O, V}
     status: str
 
 
@@ -523,6 +778,10 @@ def build_and_solve(settings: ScheduleSettings) -> Solution:
     day_cap_set = set(day_cap)
     weekend_days = weekend_day_indices(S)
     weekend_pairs = weekend_pair_indices(S)
+    lv = leave_day_sets(S)                      # per-employee leave day indices
+    tgt = shift_targets(S)                      # exact totals, prorated by leave
+    segs = available_segments(S)                # per-employee free stretches
+    has_leave = any(lv)                         # gates every leave-only branch
 
     model = cp_model.CpModel()
 
@@ -541,15 +800,22 @@ def build_and_solve(settings: ScheduleSettings) -> Solution:
             for d in range(days):
                 model.Add(night[(e, d)] == 0)
 
+    # Leave days are hard-blocked: no work may be scheduled on them (night <=
+    # work zeroes the night for free). Adds no constraint when leave is empty.
+    for e in range(n):
+        for d in sorted(lv[e]):
+            model.Add(work[(e, d)] == 0)
+
     # Fixed nights-only team: every working day is a night.
     if not S.is_rotate and S.night_team_nights_only:
         for e in elig_set:
             for d in range(days):
                 model.Add(work[(e, d)] == night[(e, d)])
 
-    # EXACT monthly workload per employee.
+    # EXACT monthly workload per employee (the target is shifts_per_employee
+    # prorated by that employee's leave days; identical when no leave).
     for e in range(n):
-        model.Add(sum(work[(e, d)] for d in range(days)) == S.shifts_per_employee)
+        model.Add(sum(work[(e, d)] for d in range(days)) == tgt[e])
 
     # Daily staffing bands. Night coverage is a band [night_min, night_max]:
     # overlap above the floor appears only where the exact totals force it (in
@@ -571,10 +837,18 @@ def build_and_solve(settings: ScheduleSettings) -> Solution:
             day_shift_next = work[(e, d + 1)] - night[(e, d + 1)]
             model.Add(night[(e, d)] + day_shift_next <= 1)
 
-    # Run-length rules. The min-block encoding is specific to a minimum of 2.
+    # Run-length rules, applied WITHIN each free stretch (leave days belong to
+    # no run; with no leave the single stretch (0, days-1) reproduces the exact
+    # pre-leave constraints). The min-block encoding is specific to a minimum
+    # of 2. The max-work/max-night windows stay global: a window crossing leave
+    # contains a forced 0, so global windows == per-segment semantics there.
     assert S.min_consec_work == 2 and S.min_consec_off == 2, (
         "build_and_solve() only encodes a minimum block length of 2.")
     for e in range(n):
+        if has_leave and tgt[e] == 0:
+            # Leave >= target: the exact total already forces every day off, and
+            # the off-run rules cannot apply to someone with no workable pattern.
+            continue
         w = [work[(e, d)] for d in range(days)]
 
         # Max consecutive WORKING days (day-shift / working run cap).
@@ -586,21 +860,33 @@ def build_and_solve(settings: ScheduleSettings) -> Solution:
             model.Add(sum(night[(e, d)] for d in range(start, start + S.max_consec_night + 1))
                       <= S.max_consec_night)
 
-        # Max consecutive OFF days: any window of (MAX_OFF+1) days has >= 1 work.
-        for start in range(days - S.max_consec_off):
-            model.Add(sum(w[start:start + S.max_consec_off + 1]) >= 1)
+        # Max consecutive OFF days: any window of (MAX_OFF+1) days INSIDE one
+        # stretch has >= 1 work (a window may never span leave -- the leave
+        # itself is the long absence, not a rostered off run).
+        for (a, b) in segs[e]:
+            for start in range(a, b - S.max_consec_off + 1):
+                model.Add(sum(w[start:start + S.max_consec_off + 1]) >= 1)
 
-        # Min consecutive working days = 2 (no isolated single work day).
-        model.Add(w[0] <= w[1])
-        model.Add(w[days - 1] <= w[days - 2])
-        for d in range(1, days - 1):
-            model.Add(w[d] <= w[d - 1] + w[d + 1])
+        # Min consecutive working days = 2 (no isolated single work day), the
+        # stretch edges playing the month-edge role. A 1-day stretch cannot
+        # host a legal 2-run, so it is forced off (validator exempts it).
+        for (a, b) in segs[e]:
+            if a == b:
+                model.Add(w[a] == 0)
+                continue
+            model.Add(w[a] <= w[a + 1])
+            model.Add(w[b] <= w[b - 1])
+            for d in range(a + 1, b):
+                model.Add(w[d] <= w[d - 1] + w[d + 1])
 
         # Min consecutive off days = 2 (no isolated single off day).
-        model.Add(w[1] <= w[0])
-        model.Add(w[days - 2] <= w[days - 1])
-        for d in range(1, days - 1):
-            model.Add(w[d - 1] + w[d + 1] - w[d] <= 1)
+        for (a, b) in segs[e]:
+            if a == b:
+                continue
+            model.Add(w[a + 1] <= w[a])
+            model.Add(w[b - 1] <= w[b])
+            for d in range(a + 1, b):
+                model.Add(w[d - 1] + w[d + 1] - w[d] <= 1)
 
     # ---- Soft fairness objectives (four equally-weighted goals) ----------
     # Each goal minimises a spread (max - min) so the burden lands evenly. They
@@ -615,20 +901,59 @@ def build_and_solve(settings: ScheduleSettings) -> Solution:
             model.Add(lo <= c)
         return hi - lo
 
+    # Signed variant for the leave-only weighted deviations: those go negative,
+    # and minmax_gap's [0, ub] bounds would make any negative value infeasible
+    # -- never reuse minmax_gap for them.
+    def signed_gap(values, name, ub):
+        hi = model.NewIntVar(-ub, ub, name + "_hi")
+        lo = model.NewIntVar(-ub, ub, name + "_lo")
+        for c in values:
+            model.Add(hi >= c)
+            model.Add(lo <= c)
+        return hi - lo
+
+    def weighted_devs(pool, exprs, per_cap):
+        """Division-free target-weighted deviations over one pool: with T = the
+        pool's summed targets and X = the pool's summed values, dev_e =
+        T*x_e - tgt[e]*X is 0 exactly when everyone sits at their target share
+        (so a leave-taker is not a permanent outlier). Leave months only --
+        validate() re-derives the identical quantity. Returns (devs, bound)."""
+        T = sum(tgt[p] for p in pool)
+        X = sum(exprs) if exprs else 0
+        devs = [T * x - tgt[p] * X for p, x in zip(pool, exprs)]
+        return devs, (T + n * days) * max(1, per_cap)
+
+    T_all = sum(tgt)
+
     # Goal 1: equal total shifts (already pinned exact; kept for robustness).
+    # With leave, measure each total against that employee's own target.
     totals = [sum(work[(e, d)] for d in range(days)) for e in range(n)]
-    gap_total = minmax_gap(totals, "tot", days)
+    if has_leave:
+        gap_total = minmax_gap([totals[e] - tgt[e] for e in range(n)], "tot", days)
+    else:
+        gap_total = minmax_gap(totals, "tot", days)
 
     # Goal 2: balanced night load across night-eligible staff.
-    night_per_emp = [sum(night[(e, d)] for d in range(days)) for e in elig] or [0]
-    gap_night = minmax_gap(night_per_emp, "night", days)
+    night_exprs = [sum(night[(e, d)] for d in range(days)) for e in elig]
+    if has_leave:
+        devs, ub = weighted_devs(elig, night_exprs, days)
+        gap_night = signed_gap(devs or [0], "night", ub)
+    else:
+        gap_night = minmax_gap(night_exprs or [0], "night", days)
 
     # Goal 3: balanced weekends -- even Fri/Sat duty within each pool, plus a
     # full Fri+Sat weekend off for everyone (best effort).
     wknd = max(1, len(weekend_days))
-    wknd_day = [sum(work[(e, d)] - night[(e, d)] for d in weekend_days) for e in day_cap] or [0]
-    wknd_night = [sum(night[(e, d)] for d in weekend_days) for e in elig] or [0]
-    gap_wknd = minmax_gap(wknd_day, "wkday", wknd) + minmax_gap(wknd_night, "wknight", wknd)
+    wknd_day = [sum(work[(e, d)] - night[(e, d)] for d in weekend_days) for e in day_cap]
+    wknd_night = [sum(night[(e, d)] for d in weekend_days) for e in elig]
+    if has_leave:
+        devs_d, ub_d = weighted_devs(day_cap, wknd_day, wknd)
+        devs_n, ub_n = weighted_devs(elig, wknd_night, wknd)
+        gap_wknd = (signed_gap(devs_d or [0], "wkday", ub_d)
+                    + signed_gap(devs_n or [0], "wknight", ub_n))
+    else:
+        gap_wknd = (minmax_gap(wknd_day or [0], "wkday", wknd)
+                    + minmax_gap(wknd_night or [0], "wknight", wknd))
     has_full_off = []
     for e in range(n):
         bits = []
@@ -650,12 +975,21 @@ def build_and_solve(settings: ScheduleSettings) -> Solution:
         # Same `bits`, same weekend_pairs, same gating as validate(), so the
         # constraint and the independent check score ONE quantity. When the
         # toggle is False this adds no variable and no constraint, so the model
-        # stays byte-identical to the pre-feature engine.
-        if S.alternating_weekends:
+        # stays byte-identical to the pre-feature engine. Leave exemptions
+        # (mirrored in validate()): a target-0 employee is exempt (leave pins
+        # every bit to 1, so any kept pair would be unsatisfiable), and any pair
+        # touching a weekend fully covered by that employee's leave is skipped.
+        if S.alternating_weekends and not (has_leave and tgt[e] == 0):
+            full_leave = [f in lv[e] and s in lv[e] for (f, s) in weekend_pairs]
             for w in range(len(bits) - 1):
+                if full_leave[w] or full_leave[w + 1]:
+                    continue
                 model.Add(bits[w] + bits[w + 1] == 1)
     num_no_full_off = n - sum(has_full_off)
-    weekend_term = gap_wknd + num_no_full_off
+    # In leave months the duty spreads above are in pool-target units; scale the
+    # people-count term to match so neither half of the goal drowns the other.
+    weekend_term = gap_wknd + (T_all * num_no_full_off if has_leave
+                               else num_no_full_off)
 
     # Goal 4: balanced "undesirable runs", spread evenly *within* each pool (a
     # fixed night team structurally carries all overlap, so a cross-pool
@@ -698,13 +1032,24 @@ def build_and_solve(settings: ScheduleSettings) -> Solution:
                 parts.append(nmax)
         rough_terms[e] = sum(parts) if parts else 0
     # Sum the per-pool spreads -- an upper bound on the max-pool spread the
-    # validator checks, so minimising it drives the validated metric down.
+    # validator checks, so minimising it drives the validated metric down. In
+    # leave months each pool's raw spread is priced in that pool's summed-target
+    # units (the same scale as the weighted goals) so the four goals stay
+    # commensurate; positive scaling is monotone, so the validator's raw check
+    # still scores the same quantity.
     pools = [elig] + ([day_cap] if set(day_cap) != elig_set else [])
-    gap_runs = sum(minmax_gap([rough_terms[e] for e in pool] or [0], f"rough{k}", 2 * days)
-                   for k, pool in enumerate(pools))
+    if has_leave:
+        gap_runs = sum(sum(tgt[p] for p in pool)
+                       * minmax_gap([rough_terms[e] for e in pool] or [0],
+                                    f"rough{k}", 2 * days)
+                       for k, pool in enumerate(pools))
+    else:
+        gap_runs = sum(minmax_gap([rough_terms[e] for e in pool] or [0],
+                                  f"rough{k}", 2 * days)
+                       for k, pool in enumerate(pools))
 
     model.Minimize(
-        S.w_fair_total * gap_total
+        S.w_fair_total * (T_all if has_leave else 1) * gap_total
         + S.w_fair_night * gap_night
         + S.w_fair_weekend * weekend_term
         + S.w_fair_runs * gap_runs
@@ -726,7 +1071,11 @@ def build_and_solve(settings: ScheduleSettings) -> Solution:
         row = []
         for d in range(days):
             if solver.Value(work[(e, d)]) == 0:
-                row.append(OFF)
+                # Label configured leave only when the hard block actually held:
+                # a worked leave day would surface as D/N below and loudly fail
+                # the "Leave days are honored" check (constraint and check score
+                # one quantity -- never label from settings alone).
+                row.append(LEAVE if d in lv[e] else OFF)
             elif solver.Value(night[(e, d)]) == 1:
                 row.append(NIGHT)
             else:
@@ -774,6 +1123,8 @@ def employee_loads(settings: ScheduleSettings, grid: list[list[str]]) -> list[di
     days = S.days
     weekend_days = weekend_day_indices(S)
     weekend_pairs = weekend_pair_indices(S)
+    lv = leave_day_sets(S)
+    tgt = shift_targets(S)
     night_counts = [sum(1 for e in range(len(S.employees)) if grid[e][d] == NIGHT)
                     for d in range(days)]
     loads = []
@@ -788,15 +1139,19 @@ def employee_loads(settings: ScheduleSettings, grid: list[list[str]]) -> list[di
         loads.append({
             "name": S.employees[e],
             "night_member": is_night_member(S, e),
-            "total": sum(1 for d in range(days) if row[d] != OFF),
+            "total": sum(1 for d in range(days) if row[d] not in (OFF, LEAVE)),
             "day": sum(1 for d in range(days) if row[d] == DAY),
             "night": sum(1 for d in range(days) if row[d] == NIGHT),
-            "weekend": sum(1 for d in weekend_days if row[d] != OFF),
+            "weekend": sum(1 for d in weekend_days if row[d] not in (OFF, LEAVE)),
             "overlaps": overlaps,
             "max_runs": max_runs,
             "rough": overlaps + max_runs,
+            # A fully-leave weekend counts as that person's weekend off (they
+            # ARE off) -- matches the solver's reified weekend bit exactly.
             "weekends_off": sum(1 for (f, s) in weekend_pairs
-                                if row[f] == OFF and row[s] == OFF),
+                                if row[f] in (OFF, LEAVE) and row[s] in (OFF, LEAVE)),
+            "leave": len(lv[e]),
+            "target": tgt[e],
         })
     return loads
 
@@ -815,6 +1170,7 @@ def coverage_per_day(settings: ScheduleSettings, grid: list[list[str]]) -> list[
     for d in range(S.days):
         day_n = sum(1 for e in range(n) if grid[e][d] == DAY)
         night_n = sum(1 for e in range(n) if grid[e][d] == NIGHT)
+        leave_n = sum(1 for e in range(n) if grid[e][d] == LEAVE)
         out.append({
             "day_index": d,
             "label": f"D{d + 1}",
@@ -822,7 +1178,8 @@ def coverage_per_day(settings: ScheduleSettings, grid: list[list[str]]) -> list[
             "is_weekend": weekday_of(S, d) in S.weekend_days,
             "day": day_n,
             "night": night_n,
-            "off": n - day_n - night_n,
+            "leave": leave_n,
+            "off": n - day_n - night_n - leave_n,
             "over_floor": night_n >= S.night_min + 1,
         })
     return out
@@ -838,6 +1195,10 @@ def validate(settings: ScheduleSettings, grid: list[list[str]]) -> list[RuleResu
     day_cap = day_capable_indices(S)
     weekend_days = weekend_day_indices(S)
     weekend_pairs = weekend_pair_indices(S)
+    lv = leave_day_sets(S)                      # re-derived from settings, never
+    tgt = shift_targets(S)                      # from the solver
+    segs = available_segments(S)
+    has_leave = any(lv)
     results: list[RuleResult] = []
 
     day_counts = [sum(1 for e in range(n) if grid[e][d] == DAY) for d in range(days)]
@@ -864,14 +1225,33 @@ def validate(settings: ScheduleSettings, grid: list[list[str]]) -> list[RuleResu
 
     results.append(RuleResult(
         "At most one shift per employee per day",
-        all(grid[e][d] in (DAY, NIGHT, OFF) for e in range(n) for d in range(days)),
+        all(grid[e][d] in (DAY, NIGHT, OFF, LEAVE) for e in range(n) for d in range(days)),
         "one code per cell"))
 
-    totals = [sum(1 for d in range(days) if grid[e][d] != OFF) for e in range(n)]
-    results.append(RuleResult(
-        f"Exactly {S.shifts_per_employee} shifts per employee",
-        all(t == S.shifts_per_employee for t in totals),
-        f"totals={totals}"))
+    # Leave days are honored: V appears exactly on the configured leave days,
+    # both directions. Extraction labels LEAVE only where the solver's work
+    # value is 0, so a violated hard-block surfaces as D/N and fails HERE.
+    if has_leave:
+        mismatches = [(S.employees[e], f"D{d + 1}") for e in range(n)
+                      for d in range(days) if (grid[e][d] == LEAVE) != (d in lv[e])]
+        results.append(RuleResult(
+            "Leave days are honored",
+            not mismatches,
+            f"{sum(len(x) for x in lv)} leave day(s) placed exactly as configured"
+            if not mismatches else f"{len(mismatches)} mismatch(es): {mismatches[:6]}"))
+
+    totals = [sum(1 for d in range(days) if grid[e][d] not in (OFF, LEAVE))
+              for e in range(n)]
+    if has_leave:
+        results.append(RuleResult(
+            "Shift totals match each employee's prorated target",
+            all(totals[e] == tgt[e] for e in range(n)),
+            f"totals={totals} targets={tgt}"))
+    else:
+        results.append(RuleResult(
+            f"Exactly {S.shifts_per_employee} shifts per employee",
+            all(t == S.shifts_per_employee for t in totals),
+            f"totals={totals}"))
 
     night_workers = {S.employees[e] for e in range(n)
                      if any(grid[e][d] == NIGHT for d in range(days))}
@@ -890,10 +1270,13 @@ def validate(settings: ScheduleSettings, grid: list[list[str]]) -> list[RuleResu
             # With a nights-only team, every member works only nights, so all of
             # them necessarily carry >=1 night. (If the team could also work days
             # a member legitimately taking zero nights must NOT count as a fault,
-            # so this check only applies in the nights-only case.)
+            # so this check only applies in the nights-only case.) A target-0
+            # member (leave >= target) legitimately works zero nights.
+            n_carriers = (sum(1 for e in elig if tgt[e] > 0) if has_leave
+                          else len(S.night_team))
             results.append(RuleResult(
-                f"Exactly {len(S.night_team)} people carry nights for the month",
-                len(night_workers) == len(S.night_team),
+                f"Exactly {n_carriers} people carry nights for the month",
+                len(night_workers) == n_carriers,
                 f"{len(night_workers)} have >=1 night: {sorted(night_workers)}"))
             nightteam_dayshifts = [S.employees[e] for e in elig_set
                                    if any(grid[e][d] == DAY for d in range(days))]
@@ -924,22 +1307,41 @@ def validate(settings: ScheduleSettings, grid: list[list[str]]) -> list[RuleResu
         max_night_run <= S.max_consec_night,
         f"longest night streak={max_night_run}"))
 
-    min_work_run = min((min(_runs([grid[e][d] != OFF for d in range(days)]), default=S.min_consec_work)
-                        for e in range(n)), default=S.min_consec_work)
+    # The off/work run rules live WITHIN each free stretch: a LEAVE cell is
+    # neither work nor off, so runs computed on exact codes already split at
+    # leave. Target-0 employees (leave >= target) are exempt -- their forced
+    # all-off month is not a rostered pattern.
+    exempt = {e for e in range(n) if has_leave and tgt[e] == 0}
+
+    min_work_run = min((min(_runs([grid[e][d] not in (OFF, LEAVE) for d in range(days)]),
+                            default=S.min_consec_work)
+                        for e in range(n) if e not in exempt), default=S.min_consec_work)
     results.append(RuleResult(
         f"Min {S.min_consec_work} consecutive working days",
         min_work_run >= S.min_consec_work,
         f"shortest work block={min_work_run}"))
 
-    min_off_run = min((min(_runs([grid[e][d] == OFF for d in range(days)]), default=S.min_consec_off)
-                       for e in range(n)), default=S.min_consec_off)
+    # Min-off exemption: an off-run exactly filling a whole stretch shorter than
+    # the minimum (a singleton day squeezed between leave/month edges) is the
+    # solver's only legal output there -- forced off, not an isolated off day.
+    def _min_off(e):
+        runs = []
+        for (a, b) in segs[e]:
+            cells = [grid[e][d] == OFF for d in range(a, b + 1)]
+            if (b - a + 1) < S.min_consec_off and all(cells):
+                continue
+            runs.extend(_runs(cells))
+        return min(runs, default=S.min_consec_off)
+
+    min_off_run = min((_min_off(e) for e in range(n) if e not in exempt),
+                      default=S.min_consec_off)
     results.append(RuleResult(
         f"Min {S.min_consec_off} consecutive off days",
         min_off_run >= S.min_consec_off,
         f"shortest off block={min_off_run}"))
 
     max_off_run = max((max(_runs([grid[e][d] == OFF for d in range(days)]), default=0)
-                       for e in range(n)), default=0)
+                       for e in range(n) if e not in exempt), default=0)
     results.append(RuleResult(
         f"Max {S.max_consec_off} consecutive off days",
         max_off_run <= S.max_consec_off,
@@ -952,10 +1354,19 @@ def validate(settings: ScheduleSettings, grid: list[list[str]]) -> list[RuleResu
     # exactly (same weekend_pairs, same off-both-days test, same gating), so a
     # solver OPTIMAL and this check can never disagree. Vacuous (<2 full weekends).
     if S.alternating_weekends:
+        # Leave exemptions mirror the constraint exactly: target-0 employees are
+        # exempt, pairs touching a fully-leave weekend are skipped, and a
+        # weekend is "off" when both days are OFF or LEAVE (the solver bit).
         alt_viol = []
         for e in range(n):
-            off = [grid[e][f] == OFF and grid[e][s] == OFF for (f, s) in weekend_pairs]
+            if e in exempt:
+                continue
+            off = [grid[e][f] in (OFF, LEAVE) and grid[e][s] in (OFF, LEAVE)
+                   for (f, s) in weekend_pairs]
+            full_leave = [f in lv[e] and s in lv[e] for (f, s) in weekend_pairs]
             for w in range(len(off) - 1):
+                if full_leave[w] or full_leave[w + 1]:
+                    continue
                 if off[w] == off[w + 1]:
                     f1, f2 = weekend_pairs[w][0], weekend_pairs[w + 1][0]
                     alt_viol.append((S.employees[e], f"D{f1 + 1}&D{f2 + 1}"))
@@ -973,37 +1384,91 @@ def validate(settings: ScheduleSettings, grid: list[list[str]]) -> list[RuleResu
         vals = list(values) or [0]
         return max(vals) - min(vals)
 
-    # F1 -- equal total shifts.
-    sp_total = spread(ld["total"] for ld in loads)
-    results.append(RuleResult(
-        f"Fairness - equal total shifts (spread <= {S.fair_tol_total})",
-        sp_total <= S.fair_tol_total,
-        f"spread={sp_total} (every total = {S.shifts_per_employee})",
-        kind="fairness", spread=sp_total, tolerance=S.fair_tol_total))
+    # F1 -- equal total shifts (with leave: each vs their own prorated target).
+    if has_leave:
+        sp_total = spread(loads[e]["total"] - tgt[e] for e in range(n))
+        results.append(RuleResult(
+            f"Fairness - equal total shifts (spread <= {S.fair_tol_total})",
+            sp_total <= S.fair_tol_total,
+            f"spread={sp_total} (every total matches its prorated target)",
+            kind="fairness", spread=sp_total, tolerance=S.fair_tol_total))
+    else:
+        sp_total = spread(ld["total"] for ld in loads)
+        results.append(RuleResult(
+            f"Fairness - equal total shifts (spread <= {S.fair_tol_total})",
+            sp_total <= S.fair_tol_total,
+            f"spread={sp_total} (every total = {S.shifts_per_employee})",
+            kind="fairness", spread=sp_total, tolerance=S.fair_tol_total))
 
-    # F2 -- balanced night load across night-eligible staff.
+    # F2 -- balanced night load across night-eligible staff. With leave the
+    # spread is over the target-weighted deviations T*x_e - tgt[e]*X -- the
+    # EXACT quantity the solver's goal-2 term minimises -- against tol * T.
     night_by = {loads[e]["name"]: loads[e]["night"] for e in elig}
-    sp_night = spread(night_by.values())
-    results.append(RuleResult(
-        f"Fairness - balanced night load (spread <= {S.fair_tol_night})",
-        sp_night <= S.fair_tol_night,
-        f"spread={sp_night}  nights/eligible={night_by}",
-        kind="fairness", spread=sp_night, tolerance=S.fair_tol_night))
+    if has_leave:
+        t_night = sum(tgt[e] for e in elig)
+        x_night = sum(loads[e]["night"] for e in elig)
+        sp_night = spread(t_night * loads[e]["night"] - tgt[e] * x_night
+                          for e in elig)
+        tol_night = S.fair_tol_night * t_night
+        results.append(RuleResult(
+            f"Fairness - balanced night load (weighted spread <= {tol_night})",
+            sp_night <= tol_night,
+            f"weighted spread={sp_night} (pool target={t_night})  "
+            f"nights/eligible={night_by}",
+            kind="fairness", spread=sp_night, tolerance=tol_night))
+    else:
+        sp_night = spread(night_by.values())
+        results.append(RuleResult(
+            f"Fairness - balanced night load (spread <= {S.fair_tol_night})",
+            sp_night <= S.fair_tol_night,
+            f"spread={sp_night}  nights/eligible={night_by}",
+            kind="fairness", spread=sp_night, tolerance=S.fair_tol_night))
 
     # F3 -- balanced weekends: even Fri/Sat duty in each pool + a weekend off each.
-    sp_wknd_day = spread(sum(1 for d in weekend_days if grid[e][d] == DAY) for e in day_cap)
-    sp_wknd_night = spread(sum(1 for d in weekend_days if grid[e][d] == NIGHT) for e in elig)
     no_weekend_off = [loads[e]["name"] for e in range(n)
                       if weekend_pairs and loads[e]["weekends_off"] == 0]
-    passed_wknd = (max(sp_wknd_day, sp_wknd_night) <= S.fair_tol_weekend
-                   and not no_weekend_off)
-    results.append(RuleResult(
-        f"Fairness - balanced weekends (spread <= {S.fair_tol_weekend}, a weekend off each)",
-        passed_wknd,
-        f"day spread={sp_wknd_day}, night spread={sp_wknd_night}, "
-        f"no weekend-off for: {no_weekend_off or 'none'}",
-        kind="fairness", spread=max(sp_wknd_day, sp_wknd_night),
-        tolerance=S.fair_tol_weekend))
+    if has_leave:
+        # Per-pool weighted tests (the pools have different target sums, so one
+        # shared bound would be wrong for whichever pool's T wasn't used). The
+        # reported spread/tolerance pair comes from the binding pool so the two
+        # numbers stay in one unit.
+        t_day = sum(tgt[e] for e in day_cap)
+        t_ni = sum(tgt[e] for e in elig)
+        xd = {e: sum(1 for d in weekend_days if grid[e][d] == DAY) for e in day_cap}
+        xn = {e: sum(1 for d in weekend_days if grid[e][d] == NIGHT) for e in elig}
+        x_day, x_ni = sum(xd.values()), sum(xn.values())
+        sp_wknd_day = spread(t_day * xd[e] - tgt[e] * x_day for e in day_cap)
+        sp_wknd_night = spread(t_ni * xn[e] - tgt[e] * x_ni for e in elig)
+        day_ok = sp_wknd_day <= S.fair_tol_weekend * t_day
+        night_ok = sp_wknd_night <= S.fair_tol_weekend * t_ni
+        passed_wknd = day_ok and night_ok and not no_weekend_off
+        if day_ok != night_ok:
+            bind_sp, bind_t = ((sp_wknd_night, t_ni) if day_ok
+                               else (sp_wknd_day, t_day))
+        else:
+            bind_sp, bind_t = ((sp_wknd_day, t_day)
+                               if sp_wknd_day * max(1, t_ni) >= sp_wknd_night * max(1, t_day)
+                               else (sp_wknd_night, t_ni))
+        results.append(RuleResult(
+            "Fairness - balanced weekends (weighted spread per pool, a weekend off each)",
+            passed_wknd,
+            f"day dev spread={sp_wknd_day} (tol {S.fair_tol_weekend * t_day}), "
+            f"night dev spread={sp_wknd_night} (tol {S.fair_tol_weekend * t_ni}), "
+            f"no weekend-off for: {no_weekend_off or 'none'}",
+            kind="fairness", spread=bind_sp,
+            tolerance=S.fair_tol_weekend * bind_t))
+    else:
+        sp_wknd_day = spread(sum(1 for d in weekend_days if grid[e][d] == DAY) for e in day_cap)
+        sp_wknd_night = spread(sum(1 for d in weekend_days if grid[e][d] == NIGHT) for e in elig)
+        passed_wknd = (max(sp_wknd_day, sp_wknd_night) <= S.fair_tol_weekend
+                       and not no_weekend_off)
+        results.append(RuleResult(
+            f"Fairness - balanced weekends (spread <= {S.fair_tol_weekend}, a weekend off each)",
+            passed_wknd,
+            f"day spread={sp_wknd_day}, night spread={sp_wknd_night}, "
+            f"no weekend-off for: {no_weekend_off or 'none'}",
+            kind="fairness", spread=max(sp_wknd_day, sp_wknd_night),
+            tolerance=S.fair_tol_weekend))
 
     # F4 -- balanced undesirable runs *within* each pool (a fixed night team
     # structurally carries all overlap; comparing it to the day team is not a
@@ -1026,7 +1491,7 @@ def validate(settings: ScheduleSettings, grid: list[list[str]]) -> list[RuleResu
 
 FILL_DAY = PatternFill("solid", fgColor="C6EFCE")
 FILL_NIGHT = PatternFill("solid", fgColor="BDD7EE")
-FILL_OFF = PatternFill("solid", fgColor="FFC7CE")
+FILL_LEAVE = PatternFill("solid", fgColor="FFC7CE")  # red now marks leave, not off
 FILL_PASS = PatternFill("solid", fgColor="C6EFCE")
 FILL_FAIL = PatternFill("solid", fgColor="FFC7CE")
 FILL_HEADER = PatternFill("solid", fgColor="305496")
@@ -1039,11 +1504,14 @@ CENTER = Alignment(horizontal="center", vertical="center")
 THIN = Side(style="thin", color="BFBFBF")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
-CELL_LABEL = {DAY: "D", NIGHT: "N", OFF: "OFF", AM: "AM"}
-CELL_FILL = {DAY: FILL_DAY, NIGHT: FILL_NIGHT, OFF: FILL_OFF, AM: FILL_AM}
+# OFF cells are truly blank (no text, no fill -- _style skips a None fill);
+# leave cells carry the red that used to mean off.
+CELL_LABEL = {DAY: "D", NIGHT: "N", OFF: "", LEAVE: "V", AM: "AM"}
+CELL_FILL = {DAY: FILL_DAY, NIGHT: FILL_NIGHT, OFF: None, LEAVE: FILL_LEAVE, AM: FILL_AM}
 
 # Hex colors reused by the Streamlit grid so the two views match.
-WEB_COLORS = {DAY: "#C6EFCE", NIGHT: "#BDD7EE", OFF: "#FFC7CE", AM: "#FFE699"}
+WEB_COLORS = {DAY: "#C6EFCE", NIGHT: "#BDD7EE", OFF: "#FFFFFF",
+              LEAVE: "#FFC7CE", AM: "#FFE699"}
 
 
 def _style(cell, value="", fill=None, font=None, align=CENTER, border=True):
@@ -1093,43 +1561,63 @@ def _write_roster(settings: ScheduleSettings, ws, grid: list[list[str]]) -> None
                FILL_WEEKEND if is_wknd else FILL_HEADER,
                FONT_BOLD if is_wknd else FONT_HEADER)
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    for j, label in enumerate(["Total", "Day", "Night", "Fri/Sat"]):
+    for j, label in enumerate(["Total", "Day", "Night", "Fri/Sat", "Hours"]):
         _style(ws.cell(1, 2 + days + j), label, FILL_HEADER, FONT_HEADER)
+
+    # Stat columns are LIVE formulas over the day cells, so a hand edit in the
+    # workbook recounts automatically. Fri/Sat columns are non-contiguous, so
+    # that formula is an explicit per-weekend-cell sum. Leave ("V") never counts
+    # as worked; Hours = Total * hours_per_shift.
+    last_col = get_column_letter(1 + days)
+    total_col = get_column_letter(2 + days)
+    wknd_cols = [get_column_letter(2 + d) for d in weekend_day_indices(S)]
+
+    def stat_formulas(r, codes):
+        rng = f"B{r}:{last_col}{r}"
+        total = "=" + "+".join(f'COUNTIF({rng},"{c}")' for c in codes)
+        frisat = ("=" + "+".join(f'COUNTIF({col}{r},"{c}")'
+                                 for col in wknd_cols for c in codes)
+                  if wknd_cols else 0)
+        return total, frisat
 
     for e in range(len(S.employees)):
         label = S.employees[e] + ("  (night team)" if is_night_member(S, e) else "")
-        _style(ws.cell(2 + e, 1), label, font=FONT_BOLD,
+        r = 2 + e
+        _style(ws.cell(r, 1), label, font=FONT_BOLD,
                align=Alignment(horizontal="left", vertical="center"))
         for d in range(days):
             code = grid[e][d]
-            _style(ws.cell(2 + e, 2 + d), CELL_LABEL[code], CELL_FILL[code])
-        total = sum(1 for d in range(days) if grid[e][d] != OFF)
-        day_n = sum(1 for d in range(days) if grid[e][d] == DAY)
-        night_n = sum(1 for d in range(days) if grid[e][d] == NIGHT)
-        wknd_n = sum(1 for d in weekend_day_indices(S) if grid[e][d] != OFF)
-        for j, val in enumerate([total, day_n, night_n, wknd_n]):
-            _style(ws.cell(2 + e, 2 + days + j), val, font=FONT_BOLD)
+            _style(ws.cell(r, 2 + d), CELL_LABEL[code], CELL_FILL[code])
+        total_f, frisat_f = stat_formulas(r, ("D", "N"))
+        rng = f"B{r}:{last_col}{r}"
+        stats = [total_f, f'=COUNTIF({rng},"D")', f'=COUNTIF({rng},"N")',
+                 frisat_f, f"={total_col}{r}*{S.hours_per_shift}"]
+        for j, val in enumerate(stats):
+            _style(ws.cell(r, 2 + days + j), val, font=FONT_BOLD)
 
     # AM staff: appended after the scheduled roster as extra rows (fixed weekly
     # pattern, entirely outside the solver -- no coverage/fairness accounting).
     # Their Day/Night stat columns are 0 by definition; Total = AM days worked,
-    # Fri/Sat = AM days landing on the weekend.
+    # Fri/Sat = AM days landing on the weekend. Hours stays blank: the AM shift
+    # length is not the solver shift length, and AM staff take no rostered leave.
     am = am_rows(S)
     base = 2 + len(S.employees)
     for a, arow in enumerate(am):
-        _style(ws.cell(base + a, 1), S.am_team[a] + "  (AM)", font=FONT_BOLD,
+        r = base + a
+        _style(ws.cell(r, 1), S.am_team[a] + "  (AM)", font=FONT_BOLD,
                align=Alignment(horizontal="left", vertical="center"))
         for d in range(days):
             code = arow[d]
-            _style(ws.cell(base + a, 2 + d), CELL_LABEL[code], CELL_FILL[code])
-        total = sum(1 for d in range(days) if arow[d] != OFF)
-        wknd_n = sum(1 for d in weekend if arow[d] != OFF)
-        for j, val in enumerate([total, 0, 0, wknd_n]):
-            _style(ws.cell(base + a, 2 + days + j), val, font=FONT_BOLD)
+            _style(ws.cell(r, 2 + d), CELL_LABEL[code], CELL_FILL[code])
+        total_f, frisat_f = stat_formulas(r, ("AM",))
+        for j, val in enumerate([total_f, 0, 0, frisat_f, ""]):
+            _style(ws.cell(r, 2 + days + j), val, font=FONT_BOLD)
 
     legend_row = len(S.employees) + len(S.am_team) + 4
     _style(ws.cell(legend_row, 1), "Legend:", font=FONT_BOLD, border=False)
     legend_items = [(DAY, "Day shift"), (NIGHT, "Night shift"), (OFF, "Off")]
+    if S.leave:
+        legend_items.append((LEAVE, "Leave"))
     if S.am_team:
         legend_items.append((AM, "AM shift"))
     for j, (code, text) in enumerate(legend_items):
@@ -1138,11 +1626,31 @@ def _write_roster(settings: ScheduleSettings, ws, grid: list[list[str]]) -> None
                align=Alignment(horizontal="left", vertical="center"))
     _style(ws.cell(legend_row + 1, 1), roster_caption(S),
            font=FONT_BOLD, border=False, align=Alignment(horizontal="left", vertical="center"))
+    _style(ws.cell(legend_row + 2, 1),
+           "Total/Day/Night/Fri-Sat/Hours recount the day cells live, so hand "
+           "edits update them; the Summary sheet and the app's validation "
+           "reflect only the generated roster.",
+           border=False, align=Alignment(horizontal="left", vertical="center"))
+
+    # Staff on leave: one row per entered range, real date cells.
+    if S.leave:
+        lt_row = legend_row + 4
+        _style(ws.cell(lt_row, 1), "Staff on leave", font=FONT_BOLD, border=False,
+               align=Alignment(horizontal="left", vertical="center"))
+        for j, h in enumerate(["Name", "From", "To"]):
+            _style(ws.cell(lt_row + 1, 1 + j), h, FILL_HEADER, FONT_HEADER)
+        for i, (name, d0, d1) in enumerate(S.leave):
+            _style(ws.cell(lt_row + 2 + i, 1), name,
+                   align=Alignment(horizontal="left", vertical="center"))
+            for j, dt in enumerate([d0, d1]):
+                cell = ws.cell(lt_row + 2 + i, 2 + j)
+                _style(cell, dt)
+                cell.number_format = "DD MMM YYYY"
 
     ws.column_dimensions["A"].width = 18
     for d in range(days):
         ws.column_dimensions[get_column_letter(2 + d)].width = 6
-    for j in range(4):
+    for j in range(5):
         ws.column_dimensions[get_column_letter(2 + days + j)].width = 8
     ws.row_dimensions[1].height = 30
     ws.freeze_panes = "B2"
@@ -1220,13 +1728,17 @@ def print_summary(settings: ScheduleSettings, grid: list[list[str]],
                   results: list[RuleResult]) -> bool:
     S = settings
     loads = employee_loads(S, grid)
+    has_leave = any(ld["leave"] for ld in loads)
     print(f"\n{roster_caption(S)}")
     print("\nPer-employee counts:")
-    print(f"  {'Employee':<12} {'Total':>5} {'Day':>4} {'Night':>6} {'Fri/Sat':>8} {'Rough':>6}")
+    lv_head = f" {'Leave':>6} {'Target':>7}" if has_leave else ""
+    print(f"  {'Employee':<12} {'Total':>5} {'Day':>4} {'Night':>6} {'Fri/Sat':>8} "
+          f"{'Rough':>6}{lv_head}")
     for ld in loads:
         tag = "  <- night team" if ld["night_member"] else ""
+        lv_cols = f" {ld['leave']:>6} {ld['target']:>7}" if has_leave else ""
         print(f"  {ld['name']:<12} {ld['total']:>5} {ld['day']:>4} {ld['night']:>6} "
-              f"{ld['weekend']:>8} {ld['rough']:>6}{tag}")
+              f"{ld['weekend']:>8} {ld['rough']:>6}{lv_cols}{tag}")
 
     print("\nRule validation:")
     all_pass = True
