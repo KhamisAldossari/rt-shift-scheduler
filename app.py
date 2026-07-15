@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Streamlit front-end for the RT shift scheduler  (calm, grid-first redesign).
+Streamlit front-end for the RT shift scheduler  (a 4-step wizard).
 
 A THIN UI over scheduler.py. It only collects configuration into one
 ScheduleSettings object and renders the engine's outputs -- it never
@@ -8,27 +8,69 @@ re-implements a constraint or recomputes a rule. Every number, count, spread,
 and PASS/FAIL on screen comes straight from a scheduler function/field
 (preflight -> build_and_solve -> validate -> export_bytes).
 
-Layout
-  Sidebar : configuration only -- month, staff, night team, staffing bands, and
-            rules (everything that builds ScheduleSettings). The rarely-touched
-            solver budget lives in an expander, with one primary "Generate
-            roster" button.
-  Main    : results, with the color-coded grid as the visual hero --
-              * a month header + compact metrics + a subtle solver status,
-              * a positive, next-step status banner (3-way: success / info / error),
-              * a prominent Excel download, then three tabs:
-                  Roster     -- the big color grid (hero), a legend, and a per-day
-                                coverage strip built from coverage_per_day().
-                  Fairness   -- the four soft goals as PASS/FAIL cards (spread vs
-                                tolerance), the per-employee summary, and the checks.
-                  Hard rules -- the independent hard-rule validation table.
+Layout -- one screen at a time, so a non-technical charge RT can build and
+export a month's roster unaided:
 
-Three render states persist across reruns via st.session_state: the initial
-hint, a preflight "blocked" state (each Problem's message + suggestion), and an
-"infeasible" state (a positive error + the engine's relaxation hints).
+  Persistent header : the app title + a custom stepper (1 Setup - 2 Check -
+                      3 Roster - 4 Export) with completed / current / upcoming
+                      states. Every step past the first has a quiet Back control
+                      and exactly one accent primary action.
+
+  Step 1 - Setup    : builds ScheduleSettings -- month, staff editor, night-team
+                      picker, AM staff editor + AM working days, a leave editor
+                      (per-person vacation ranges inside the month; the engine
+                      blocks those days and prorates the shift target), and one
+                      collapsed "Adjust rules" expander (staffing bands,
+                      shifts/employee, run-length caps, the alternating-weekends
+                      toggle, and a plain-language "Scheduling effort" level --
+                      raising it scales the engine's deterministic search budget
+                      AND its wall-clock safety net together, so the net never
+                      binds first). Duplicate staff names are flagged inline and
+                      block Continue -- the engine's preflight doesn't check for
+                      those, so this screen does. Primary: Continue.
+  Step 2 - Check    : runs preflight automatically. Problems render calmly as
+                      message + suggestion; a clean setup shows a plain recap.
+                      If a roster already exists for these exact settings (e.g.
+                      Back landed here after a solve), the primary is "View
+                      roster" -- no re-solve -- with "Generate again" alongside
+                      it; otherwise the primary is "Generate roster", which
+                      solves. No valid roster -> a plain explanation + the
+                      engine's things-to-try (never the solver status). Solved ->
+                      results stored, advance to step 3.
+  Step 3 - Roster   : a 3-way status banner (hard fail / soft-fairness miss /
+                      all clear), the color-coded grid as the visual hero with a
+                      legend, the per-day coverage strip, the required-rule
+                      PASS/FAIL table (Rule + Result; the raw Measured values sit
+                      in a "Technical detail" expander), the four fairness goals
+                      as cards (spread vs tolerance), and the per-employee
+                      summary. On a hard-rule failure the primary is "Back to
+                      setup" instead of Continue -- this roster must not reach
+                      Export.
+  Step 4 - Export   : a summary card + the one-click Excel download
+                      (schedule_YYYY_MM.xlsx). Re-checks the stored result for a
+                      hard-rule failure (defense in depth, in case this screen is
+                      reached some other way) and shows the same do-not-publish
+                      warning if so. A secondary "Start a new month" clears the
+                      roster and advances the mirrored month by one (December
+                      wraps to January of the next year); staff and rules survive.
+
+Wizard state lives in st.session_state: `step` (1-4) and `setup` (a plain, non-
+widget dict that mirrors every step-1 input so custom entries survive Back
+navigation -- widget keys are garbage-collected when their step isn't on screen).
+The staff, AM, and leave data_editor widgets are seeded from DataFrames that are
+rebuilt only when (re)entering step 1, not on every rerun -- rebuilding a seed
+from the mirror every rerun would change it after each edit and flip the
+editor's widget identity, silently reverting the second of two consecutive edits.
+A generated `result` snapshots the settings signature it was built from and is
+dropped when the setup changes, so steps 3-4 never show a stale roster.
 
 The grid colors come from scheduler.WEB_COLORS (mirrors the Excel fills) and the
-chrome from .streamlit/config.toml, so the web view and the workbook agree.
+chrome from .streamlit/config.toml, so the web view and the workbook agree. All
+user-facing copy stays in plain operational language -- no solver/engine jargon
+(OPTIMAL, FEASIBLE, CP-SAT, deterministic) reaches the screen; rule names shown
+on screen get a cosmetic glyph substitution ("->", ">=", "<=" render as their
+arrow/comparator symbols) purely for readability, without touching the
+underlying RuleResult data.
 
 Run:  ./.venv/bin/streamlit run app.py
 """
@@ -36,6 +78,7 @@ Run:  ./.venv/bin/streamlit run app.py
 from __future__ import annotations
 
 import calendar
+import copy
 import datetime
 
 import pandas as pd
@@ -52,192 +95,178 @@ st.set_page_config(
     page_title="RT Shift Scheduler",
     page_icon=":material/calendar_month:",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
-# A small amount of CSS, scoped to OUR OWN markup only (a kicker label and the
-# grid legend) so we never fight Streamlit's internals across versions. Palette
-# and typography come from .streamlit/config.toml; grid colors from WEB_COLORS.
+# A small amount of CSS, scoped to OUR OWN markup only (the app bar, the wizard
+# stepper, kicker labels, and the grid legend) so we never fight Streamlit's
+# internals across versions. Palette and typography come from
+# .streamlit/config.toml; grid colors from WEB_COLORS.
 st.markdown(
     """
     <style>
-      .kicker{font-size:.72rem;letter-spacing:.16em;font-weight:600;
-              color:#7A8194;text-transform:uppercase;margin:0 0 .15rem}
-      .legend{display:flex;flex-wrap:wrap;gap:.45rem 1.2rem;align-items:center;
-              font-size:.85rem;color:#5A6273;margin:.1rem 0 .35rem}
+      .appbar{text-align:center;margin:.1rem 0 0}
+      .brand-kicker{font-size:.72rem;letter-spacing:.18em;font-weight:600;
+        color:#0E7569;text-transform:uppercase;margin-bottom:.15rem}
+      .brand-title{font-size:1.55rem;font-weight:700;color:#1C2B2A;letter-spacing:-.01em}
+
+      .stepper{display:flex;align-items:center;gap:.55rem;max-width:660px;
+        margin:1rem auto 1.7rem;padding:0 .4rem}
+      .stepper .step{display:inline-flex;align-items:center;gap:.5rem;white-space:nowrap}
+      .stepper .dot{width:1.72rem;height:1.72rem;border-radius:50%;display:inline-flex;
+        align-items:center;justify-content:center;font-weight:600;font-size:.82rem;
+        border:1.5px solid #D9D6CE;color:#6E6F68;background:#FBFAF8;flex:none}
+      .stepper .lbl{font-size:.86rem;font-weight:500;color:#6E6F68}
+      .stepper .step.done .dot{background:#0E7569;border-color:#0E7569;color:#FBFAF8}
+      .stepper .step.done .lbl{color:#3D4B49}
+      .stepper .step.now .dot{border-color:#0E7569;color:#0E7569;background:#E4EFEC;
+        border-width:2px}
+      .stepper .step.now .lbl{color:#0E7569;font-weight:600}
+      .stepper .bar{flex:1 1 auto;min-width:.8rem;height:2px;background:#E4E2DC;
+        border-radius:2px}
+      .stepper .bar.done{background:#0E7569}
+
+      .kicker{font-size:.7rem;letter-spacing:.15em;font-weight:600;color:#6E6F68;
+        text-transform:uppercase;margin:.25rem 0 .1rem}
+
+      .legend{display:flex;flex-wrap:wrap;gap:.4rem 1.15rem;align-items:center;
+        font-size:.85rem;color:#5C6360;margin:.15rem 0 .5rem}
       .legend-item{display:inline-flex;align-items:center;gap:.42rem}
       .legend-sw{width:.95rem;height:.95rem;border-radius:.28rem;
-                 border:1px solid rgba(20,30,55,.12);display:inline-block}
-      .legend-code{font-weight:700;color:#1B2330}
-      .legend-star{color:#305496;font-weight:700;font-size:1.05rem;line-height:1}
+        border:1px solid rgba(28,43,42,.14);display:inline-block}
+      .legend-code{font-weight:700;color:#1C2B2A}
+      .legend-star{color:#0E7569;font-weight:700;font-size:1.05rem;line-height:1}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-defaults = sch.ScheduleSettings()       # EVERY UI default is pulled from here
+# EVERY UI default is pulled from here -- no scheduling value is hard-coded.
+defaults = sch.ScheduleSettings()
+
+# Plain-language "Scheduling effort" levels. The base level is the engine's own
+# default budget, so the out-of-box roster is bit-identical to the pristine
+# engine; the higher levels simply spend more (deterministic) search time. This
+# is an effort knob, not a scheduling rule -- the words solver/deterministic/
+# CP-SAT never reach the user-facing copy.
+#
+# Both the deterministic limit AND its wall-clock safety net scale together by
+# the same multiplier, so the safety net never creeps closer to the
+# deterministic budget as effort rises (it must stay a net, not a binding
+# limit, or the roster stops being reproducible -- see ScheduleSettings).
+EFFORT_LEVELS = ["Standard", "Thorough", "Maximum"]
+EFFORT_MULTIPLIER = {"Standard": 1, "Thorough": 2.5, "Maximum": 5}
+EFFORT_DET_LIMIT = {lvl: defaults.solver_det_time_limit * m
+                    for lvl, m in EFFORT_MULTIPLIER.items()}
+EFFORT_TIME_LIMIT = {lvl: defaults.solver_time_limit * m
+                     for lvl, m in EFFORT_MULTIPLIER.items()}
 
 
 # ---------------------------------------------------------------------------
-# APP HEADER  (constant identity; the month-specific header lives in results)
+# WIZARD STATE  (step index + a plain mirror of every step-1 input)
 # ---------------------------------------------------------------------------
 
-st.markdown('<div class="kicker">Respiratory Therapy &middot; Workforce</div>',
-            unsafe_allow_html=True)
-st.title("Monthly Shift Scheduler")
-st.caption(
-    "Configure a month, generate a fair roster, and download the color-coded "
-    "Excel. Every hard rule is enforced by the solver and independently "
-    "re-checked; the four fairness goals are reported with their measured spread.")
-st.divider()
+def _init_setup() -> dict:
+    """A plain (non-widget) dict seeded entirely from ScheduleSettings defaults.
+
+    Widget keys are garbage-collected on reruns where their step isn't rendered,
+    so step-1 inputs are mirrored here on every step-1 render and widgets re-seed
+    from here on return -- this is what makes custom staff survive Back navigation.
+    """
+    return {
+        "year": defaults.year,
+        "month": defaults.month,
+        "employees": list(defaults.employees),
+        "night_team": list(defaults.night_team),
+        "am_team": list(defaults.am_team),
+        "am_days": list(defaults.am_days),
+        "leave": list(defaults.leave),
+        "day_min": defaults.day_min,
+        "day_max": defaults.day_max,
+        "night_min": defaults.night_min,
+        "night_max": defaults.night_max,
+        "shifts": defaults.shifts_per_employee,
+        "max_day": defaults.max_consec_work,
+        "max_night": defaults.max_consec_night,
+        "min_work": defaults.min_consec_work,
+        "min_off": defaults.min_consec_off,
+        "max_off": defaults.max_consec_off,
+        "alt_weekends": defaults.alternating_weekends,
+        "effort": EFFORT_LEVELS[0],
+    }
 
 
-# ---------------------------------------------------------------------------
-# SIDEBAR  -- configuration only (every input that populates ScheduleSettings)
-# ---------------------------------------------------------------------------
+def _seed_editors() -> None:
+    """(Re)build the three data_editor seed frames from the setup mirror.
 
-with st.sidebar:
-    st.markdown('<div class="kicker">Configuration</div>', unsafe_allow_html=True)
-
-    st.subheader("1 · Month")
-    col_y, col_m = st.columns(2)
-    year = col_y.number_input("Year", min_value=2000, max_value=2100,
-                              value=defaults.year, step=1)
-    month = col_m.selectbox("Month", options=list(range(1, 13)),
-                            index=defaults.month - 1,
-                            format_func=lambda m: calendar.month_name[m])
-
-    st.subheader("2 · Staff")
-    st.caption("Add, remove, or rename employees.")
-    emp_df = st.data_editor(
-        pd.DataFrame({"Employee": list(defaults.employees)}),
-        num_rows="dynamic", width="stretch", hide_index=True, key="emp_editor",
-        column_config={"Employee": st.column_config.TextColumn(
-            "Employee", width="large", help="One row per person.")})
-    employees = [str(x).strip() for x in emp_df["Employee"].tolist() if str(x).strip()]
-
-    st.subheader("3 · Night team")
-    night_team = st.multiselect(
-        "Night team (any size ≥ 1 — they work nights only)",
-        options=employees,
-        default=[e for e in defaults.night_team if e in employees])
-    if not night_team:
-        st.warning("Pick at least one night-team member.")
-    else:
-        st.caption(f"{len(night_team)} night-team member(s) selected.")
-
-    st.subheader("4 · AM shift")
-    st.caption("Fixed-pattern staff rostered outside the solver — appended as extra "
-               "rows, not part of coverage or fairness. Leave empty if unused.")
-    am_df = st.data_editor(
-        pd.DataFrame({"AM staff": pd.Series(list(defaults.am_team), dtype="object")}),
-        num_rows="dynamic", width="stretch", hide_index=True, key="am_editor",
-        column_config={"AM staff": st.column_config.TextColumn(
-            "AM staff", width="large", help="One row per AM-shift person.")})
-    am_team = [str(x).strip() for x in am_df["AM staff"].tolist() if str(x).strip()]
-    am_days = st.multiselect(
-        "AM working days", options=sch.WEEKDAY_NAMES,
-        default=list(defaults.am_days),
-        help="The weekdays AM staff work every week (default Sun–Thu).")
-
-    st.subheader("5 · Leave")
-    st.caption("Vacation inside the month: those days are blocked ('V') and the "
-               "person's shift target drops by one per leave day. One row per "
-               "range; several rows per person are fine. Rows missing a name or "
-               "a date are ignored.")
-    month_first = datetime.date(int(year), int(month), 1)
-    month_last = datetime.date(int(year), int(month),
-                               calendar.monthrange(int(year), int(month))[1])
-    leave_df = st.data_editor(
-        pd.DataFrame({"Employee": pd.Series(dtype="object"),
-                      "From": pd.Series(dtype="object"),
-                      "To": pd.Series(dtype="object")}),
-        num_rows="dynamic", width="stretch", hide_index=True, key="leave_editor",
-        column_config={
-            "Employee": st.column_config.SelectboxColumn(
-                "Employee", options=employees, width="medium",
-                help="Scheduled staff only — AM staff cannot take rostered leave."),
-            "From": st.column_config.DateColumn(
-                "From", min_value=month_first, max_value=month_last),
-            "To": st.column_config.DateColumn(
-                "To", min_value=month_first, max_value=month_last),
-        })
-    # Collect complete rows only (name + both dates); every rule-level check --
-    # unknown names, reversed or out-of-month ranges -- stays in preflight.
-    leave_rows = []
-    for _, lrow in leave_df.iterrows():
-        name, d_from, d_to = lrow.get("Employee"), lrow.get("From"), lrow.get("To")
-        if pd.isna(name) or not str(name).strip() or pd.isna(d_from) or pd.isna(d_to):
-            continue
-        leave_rows.append((str(name).strip(),
-                           pd.Timestamp(d_from).date(), pd.Timestamp(d_to).date()))
-
-    st.subheader("6 · Staffing per day")
-    c1, c2 = st.columns(2)
-    day_min = c1.number_input("Min day staff", 0, 50, defaults.day_min)
-    day_max = c2.number_input("Max day staff", 1, 50, defaults.day_max)
-    c3, c4 = st.columns(2)
-    night_min = c3.number_input("Min nights/day", 0, 10, defaults.night_min)
-    night_max = c4.number_input("Max nights/day (overlap)", 1, 10, defaults.night_max)
-
-    st.subheader("7 · Rules")
-    shifts = st.number_input("Shifts per employee (exact)", 1, 31,
-                             defaults.shifts_per_employee)
-    c5, c6 = st.columns(2)
-    max_day = c5.number_input("Max consecutive day shifts", 1, 14, defaults.max_consec_work)
-    max_night = c6.number_input("Max consecutive nights", 1, 14, defaults.max_consec_night)
-    c7, c8 = st.columns(2)
-    min_work = c7.number_input("Min consecutive work", 2, 7, defaults.min_consec_work,
-                               help="The model encodes a minimum of 2; other values are "
-                                    "reported as infeasible by preflight.")
-    min_off = c8.number_input("Min consecutive off", 2, 7, defaults.min_consec_off,
-                              help="The model encodes a minimum of 2; other values are "
-                                   "reported as infeasible by preflight.")
-    max_off = st.number_input("Max consecutive off", 1, 14, defaults.max_consec_off)
-    alt_weekends = st.toggle(
-        "Alternating weekends (hard)", value=defaults.alternating_weekends,
-        help="On: every employee's full Fri+Sat weekends strictly alternate "
-             "off / on / off — of every two consecutive full weekends, exactly one "
-             "is fully off. A HARD rule (not a soft fairness goal); it can make very "
-             "tight months infeasible, in which case turn it off and re-generate.")
-
-    with st.expander("Advanced · solver budget"):
-        det_budget = st.number_input(
-            "Solver budget (deterministic units)", 4.0, 240.0,
-            float(defaults.solver_det_time_limit), step=4.0,
-            help="Higher = more search = better fairness convergence on hard months, "
-                 "at the cost of solve time. The budget is deterministic, so the "
-                 "roster is reproducible regardless of machine speed.")
-
-    st.divider()
-    generate = st.button("Generate roster", type="primary", width="stretch",
-                         icon=":material/bolt:")
+    Called only when (re)entering step 1 -- NOT on every step-1 rerun -- so the
+    same DataFrame instance backs each editor across reruns while the user
+    stays on the screen. Rebuilding the seed from the mirror on every rerun
+    (the mirror changes after each edit) flips the editor's widget identity,
+    which silently reverts the second of two consecutive edits.
+    """
+    cfg = st.session_state.setup
+    st.session_state["_emp_seed"] = pd.DataFrame(
+        {"Employee": pd.Series(list(cfg["employees"]), dtype="object")})
+    st.session_state["_am_seed"] = pd.DataFrame(
+        {"AM staff": pd.Series(list(cfg["am_team"]), dtype="object")})
+    st.session_state["_leave_seed"] = pd.DataFrame(
+        {"Employee": pd.Series([r[0] for r in cfg["leave"]], dtype="object"),
+         "From": pd.Series([r[1] for r in cfg["leave"]], dtype="datetime64[ns]"),
+         "To": pd.Series([r[2] for r in cfg["leave"]], dtype="datetime64[ns]")})
 
 
-def make_settings() -> sch.ScheduleSettings:
-    """Collect every sidebar input into the single ScheduleSettings object.
+if "step" not in st.session_state:
+    st.session_state.step = 1
+if "setup" not in st.session_state:
+    st.session_state.setup = _init_setup()
+if "_emp_seed" not in st.session_state:
+    _seed_editors()
+
+
+def go_to(step: int) -> None:
+    """Switch screens. Leaving for Setup clears any transient solve outcome
+    and re-seeds the staff/AM/leave editors from the (possibly just-updated)
+    mirror."""
+    st.session_state.step = step
+    if step == 1:
+        st.session_state.pop("gen_failed", None)
+        _seed_editors()
+    st.rerun()
+
+
+def make_settings(cfg: dict) -> sch.ScheduleSettings:
+    """Collect the setup dict into the single ScheduleSettings object.
 
     The UI is fixed-team only -- rotation_mode is left at its ScheduleSettings
-    default (fixed_team); rotate mode remains available in the engine/CLI via
-    rotation_mode=sch.ROTATE. Fairness tuning (tolerances + objective weights)
-    is intentionally not exposed here either -- the engine defaults apply. No
+    default (fixed_team); rotate mode stays engine/CLI-only. Fairness tuning
+    (tolerances + objective weights) is intentionally not exposed either. No
     scheduling value is hard-coded here -- defaults all come from
-    sch.ScheduleSettings().
+    sch.ScheduleSettings(); the effort level maps to a deterministic budget.
     """
     return sch.ScheduleSettings(
-        year=int(year), month=int(month),
-        employees=employees, night_team=night_team,
-        am_team=am_team, am_days=tuple(am_days),
-        leave=leave_rows,
-        day_min=int(day_min), day_max=int(day_max),
-        night_min=int(night_min), night_max=int(night_max),
-        shifts_per_employee=int(shifts),
-        max_consec_work=int(max_day), max_consec_night=int(max_night),
-        min_consec_work=int(min_work), min_consec_off=int(min_off),
-        max_consec_off=int(max_off),
-        alternating_weekends=bool(alt_weekends),
-        solver_det_time_limit=float(det_budget),
+        year=int(cfg["year"]), month=int(cfg["month"]),
+        employees=cfg["employees"], night_team=cfg["night_team"],
+        am_team=cfg["am_team"], am_days=tuple(cfg["am_days"]),
+        leave=cfg["leave"],
+        day_min=int(cfg["day_min"]), day_max=int(cfg["day_max"]),
+        night_min=int(cfg["night_min"]), night_max=int(cfg["night_max"]),
+        shifts_per_employee=int(cfg["shifts"]),
+        max_consec_work=int(cfg["max_day"]), max_consec_night=int(cfg["max_night"]),
+        min_consec_work=int(cfg["min_work"]), min_consec_off=int(cfg["min_off"]),
+        max_consec_off=int(cfg["max_off"]),
+        alternating_weekends=bool(cfg["alt_weekends"]),
+        solver_det_time_limit=float(EFFORT_DET_LIMIT.get(cfg["effort"],
+                                                         defaults.solver_det_time_limit)),
+        solver_time_limit=float(EFFORT_TIME_LIMIT.get(cfg["effort"],
+                                                      defaults.solver_time_limit)),
     )
+
+
+def _sig(cfg: dict):
+    """A value-comparable snapshot of the setup, used to invalidate a stale
+    roster when the user edits settings after generating."""
+    return copy.deepcopy(cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +293,7 @@ def color_cell(val: str) -> str:
     code = {"D": sch.DAY, "N": sch.NIGHT, "V": sch.LEAVE, "": sch.OFF,
             "AM": sch.AM}.get(val)
     bg = sch.WEB_COLORS.get(code, "#FFFFFF")
-    return f"background-color: {bg}; text-align: center; color: #13233B; font-weight: 600;"
+    return f"background-color: {bg}; text-align: center; color: #1C2B2A; font-weight: 600;"
 
 
 def color_result(val: str) -> str:
@@ -272,9 +301,9 @@ def color_result(val: str) -> str:
     FAIL uses the LEAVE red: OFF is now a blank white cell, so borrowing it
     would silently blank every FAIL badge."""
     if val == "PASS":
-        return f"background-color: {sch.WEB_COLORS[sch.DAY]}; color: #13233B; font-weight: 600;"
+        return f"background-color: {sch.WEB_COLORS[sch.DAY]}; color: #1C2B2A; font-weight: 600;"
     if val == "FAIL":
-        return f"background-color: {sch.WEB_COLORS[sch.LEAVE]}; color: #13233B; font-weight: 600;"
+        return f"background-color: {sch.WEB_COLORS[sch.LEAVE]}; color: #1C2B2A; font-weight: 600;"
     return ""
 
 
@@ -326,17 +355,17 @@ def render_coverage(S: sch.ScheduleSettings, grid: list[list[str]]) -> None:
         css = pd.DataFrame("", index=_df.index, columns=_df.columns)
         for j in range(len(_df.columns)):
             wk, ov = is_wknd[j], over[j]
-            # Row 0 -- day staff: light green, amber on weekends.
+            # Row 0 -- day staff: soft warm green, amber wash on weekends.
             css.iloc[0, j] = (
-                f"background-color: {'#F6F1DD' if wk else '#F1F8F3'}; "
-                "text-align: center; color: #2C3A30; font-weight: 500;")
-            # Row 1 -- night staff: light blue; deeper blue + bold on overlap days.
+                f"background-color: {'#F3EDDA' if wk else '#EAF1EC'}; "
+                "text-align: center; color: #26332C; font-weight: 500;")
+            # Row 1 -- night staff: soft teal; deeper teal + bold on overlap days.
             if ov:
-                nbg, ncol, nwt = "#D6E2F4", "#1F3A66", 700
+                nbg, ncol, nwt = "#CFE1DD", "#1C4A44", 700
             elif wk:
-                nbg, ncol, nwt = "#F6F1DD", "#2B3550", 500
+                nbg, ncol, nwt = "#F3EDDA", "#2B3B39", 500
             else:
-                nbg, ncol, nwt = "#EEF3FA", "#2B3550", 500
+                nbg, ncol, nwt = "#E7EFEE", "#2B3B39", 500
             css.iloc[1, j] = (f"background-color: {nbg}; text-align: center; "
                               f"color: {ncol}; font-weight: {nwt};")
         return css
@@ -344,32 +373,38 @@ def render_coverage(S: sch.ScheduleSettings, grid: list[list[str]]) -> None:
     st.dataframe(df.style.apply(_styles, axis=None), width="stretch",
                  height=36 + 36 * len(df), row_height=36)
     st.caption("Staff on duty each day. Amber columns are the Fri/Sat weekend; a "
-               "deeper-blue night cell is a forced extra (overlap) night above the floor.")
+               "deeper-teal night cell is a forced extra (overlap) night above the floor.")
 
 
-def render_checks(rule_results) -> None:
-    """A scannable PASS/FAIL table for a list of RuleResults (display only)."""
-    checks = pd.DataFrame({
-        "Rule": [r.name for r in rule_results],
+def _pretty_rule_name(name: str) -> str:
+    """Cosmetic glyph substitution for display only -- operates on a COPY of
+    the string; the underlying RuleResult.name is never touched or re-derived."""
+    return name.replace("->", "→").replace(">=", "≥").replace("<=", "≤")
+
+
+def render_checks(rule_results, full: bool = True) -> None:
+    """A scannable PASS/FAIL table for a list of RuleResults (display only).
+
+    `full=False` drops the Measured column for a quick-scan view -- the same
+    numbers stay reachable in a paired "Technical detail" expander.
+    """
+    data = {
+        "Rule": [_pretty_rule_name(r.name) for r in rule_results],
         "Result": ["PASS" if r.passed else "FAIL" for r in rule_results],
-        "Measured": [r.measured for r in rule_results],
-    })
+    }
+    column_config = {
+        "Rule": st.column_config.TextColumn(width="large"),
+        "Result": st.column_config.TextColumn(width="small"),
+    }
+    if full:
+        data["Measured"] = [r.measured for r in rule_results]
+        column_config["Measured"] = st.column_config.TextColumn(width="medium")
+    checks = pd.DataFrame(data)
     st.dataframe(
         checks.style.map(color_result, subset=["Result"]),
         width="stretch", hide_index=True,
         height=min(80 + 35 * len(checks), 600),
-        column_config={
-            "Rule": st.column_config.TextColumn(width="large"),
-            "Result": st.column_config.TextColumn(width="small"),
-            "Measured": st.column_config.TextColumn(width="medium"),
-        })
-
-
-def render_problems(title: str, problems) -> None:
-    """Surface each preflight Problem's message AND its suggestion."""
-    st.error(f"**{title}**")
-    for p in problems:
-        st.markdown(f"- {p.message}  \n  💡 *{p.suggestion}*")
+        column_config=column_config)
 
 
 def status_banner(hard, fairness) -> None:
@@ -383,14 +418,15 @@ def status_banner(hard, fairness) -> None:
         # Fairness goals are soft: a miss means the roster is still valid (every
         # hard rule holds), just not perfectly balanced this month.
         st.info(
-            f"All hard safety rules pass — this roster is valid and ready to publish. "
-            f"{len(soft_fail)} soft fairness goal(s) couldn't be fully balanced this "
-            f"month (see the spread in the **Fairness** tab). Raise the solver "
-            f"budget (Advanced expander) to push the balance further.")
+            f"All required safety rules pass — this roster is valid and ready to "
+            f"publish. {len(soft_fail)} fairness goal(s) couldn't be fully balanced "
+            f"this month (see the fairness goals below). Some months can't be "
+            f"balanced perfectly. Raising the scheduling effort in Setup and "
+            f"generating again sometimes improves the balance.")
     else:
         st.error(
-            f"{len(hard_fail)} hard rule(s) failed — do not publish. Open the "
-            f"**Hard rules** tab to see which constraint was violated.")
+            f"{len(hard_fail)} required rule(s) did not pass — do not publish. See the "
+            f"failing rule in the required-rules table below.")
 
 
 def short_goal(name: str) -> str:
@@ -398,153 +434,526 @@ def short_goal(name: str) -> str:
     return name.replace("Fairness - ", "").split(" (")[0].title()
 
 
+def render_problems(problems) -> None:
+    """Surface each preflight Problem calmly: its message (what's wrong) and its
+    suggestion (what to do), one bordered card each -- no wall of red."""
+    st.warning("These settings need attention before the month can be scheduled.")
+    for p in problems:
+        with st.container(border=True):
+            st.markdown(f"**{p.message}**")
+            st.caption(f"Try: {p.suggestion}")
+
+
+def fairness_cards(fairness) -> None:
+    """The four soft goals as PASS/FAIL cards with spread vs tolerance."""
+    cards = st.columns(len(fairness))
+    for col, r in zip(cards, fairness):
+        with col.container(border=True):
+            st.markdown(f"**{short_goal(r.name)}**")
+            if r.passed:
+                st.badge("Pass", color="green", icon=":material/check_circle:")
+            else:
+                st.badge("Fail", color="red", icon=":material/cancel:")
+            st.caption(f"spread {r.spread} · tolerance {r.tolerance}")
+            # A goal can sit within tolerance yet still FAIL on a non-spread
+            # condition (e.g. the weekends goal also wants a full Fri+Sat off for
+            # everyone). Say so, so the card never looks self-contradictory; the
+            # full reason is in the measured details below.
+            if (not r.passed and r.spread is not None
+                    and r.tolerance is not None and r.spread <= r.tolerance):
+                st.caption("Within tolerance, but another part of this goal isn't "
+                           "fully met this month — see the technical detail below.")
+    with st.expander("Technical detail"):
+        render_checks(fairness)
+
+
+def employee_table(S: sch.ScheduleSettings, grid: list[list[str]]) -> None:
+    """The per-employee fairness summary, straight from employee_loads()."""
+    loads = sch.employee_loads(S, grid)
+    df = pd.DataFrame([{
+        "Employee": ld["name"] + (" ∗" if ld["night_member"] else ""),
+        "Total": ld["total"], "Leave": ld["leave"], "Target": ld["target"],
+        "Day": ld["day"], "Night": ld["night"],
+        "Fri/Sat": ld["weekend"], "Weekends off": ld["weekends_off"],
+        "Overlaps": ld["overlaps"], "Max-runs": ld["max_runs"],
+    } for ld in loads])
+    st.dataframe(df, width="stretch", hide_index=True,
+                 height=min(80 + 35 * len(df), 460))
+    st.caption("∗ night-team member. Overlaps = forced extra-night days worked · "
+               "Max-runs = max-length day/night streaks absorbed · both are balanced "
+               "within each pool (day-capable vs night-eligible).")
+
+
+def recap(S: sch.ScheduleSettings) -> None:
+    """A short, plain-language summary of what Generate will produce."""
+    st.markdown(f"**{S.month_label}** · {S.days} days")
+    st.markdown(f"- **{len(S.employees)}** staff scheduled")
+    st.markdown(f"- Night team (nights only): {', '.join(S.night_team) or '(none selected)'}")
+    if S.am_team:
+        st.markdown(f"- AM shift: {', '.join(S.am_team)} on {', '.join(S.am_days)}")
+    if S.leave:
+        st.markdown(f"- Leave: {len(S.leave)} range(s) entered — those days are "
+                    f"blocked and each person's shift target drops to match")
+    st.markdown(f"- Each day: {S.day_min}–{S.day_max} day staff, "
+                f"{S.night_min}–{S.night_max} night staff")
+    st.markdown(f"- {S.shifts_per_employee} shifts per person; at most "
+                f"{S.max_consec_work} day / {S.max_consec_night} night shifts in a row")
+    if S.alternating_weekends:
+        st.markdown("- Alternating weekends: on")
+
+
 # ---------------------------------------------------------------------------
-# GENERATE  (config -> preflight -> solve -> validate -> export); results persist
-# in st.session_state so they survive Streamlit reruns.
+# PERSISTENT HEADER + STEPPER
 # ---------------------------------------------------------------------------
 
-if generate:
-    S = make_settings()
-    problems = sch.preflight(S)
-    if problems:
-        st.session_state.pop("result", None)
-        st.session_state.pop("infeasible", None)
-        st.session_state["blocked"] = problems
-    else:
-        st.session_state.pop("blocked", None)
-        with st.spinner("Solving…"):
-            sol = sch.build_and_solve(S)
-        if not sol.grid:
-            st.session_state.pop("result", None)
-            st.session_state["infeasible"] = {
-                "status": sol.status, "hints": sch.relaxation_hints(S)}
+def render_header(step: int) -> None:
+    st.markdown(
+        '<div class="appbar">'
+        '<div class="brand-kicker">Respiratory Therapy Workforce</div>'
+        '<div class="brand-title">Monthly Shift Scheduler</div>'
+        '</div>',
+        unsafe_allow_html=True)
+    labels = ["Setup", "Check", "Roster", "Export"]
+    html = ['<div class="stepper">']
+    for i, label in enumerate(labels, start=1):
+        cls = "step done" if i < step else "step now" if i == step else "step"
+        dot = "&#10003;" if i < step else str(i)          # check-mark for completed
+        html.append(f'<div class="{cls}"><span class="dot">{dot}</span>'
+                    f'<span class="lbl">{label}</span></div>')
+        if i < len(labels):
+            html.append(f'<div class="{"bar done" if i < step else "bar"}"></div>')
+    html.append('</div>')
+    st.markdown("".join(html), unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# STEP 1 -- SETUP  (builds ScheduleSettings; mirrors inputs into session_state)
+# ---------------------------------------------------------------------------
+
+def screen_setup() -> None:
+    cfg = st.session_state.setup
+    _, mid, _ = st.columns([1, 2.2, 1])
+    with mid:
+        st.subheader("Set up the month")
+        st.caption("Choose the month, list the staff, and pick the night team. "
+                   "The rule settings are pre-filled — open Adjust rules only if "
+                   "your department's rules differ.")
+
+        # -- Month --------------------------------------------------------
+        st.markdown('<div class="kicker">Month</div>', unsafe_allow_html=True)
+        cy, cm = st.columns(2)
+        year = cy.number_input("Year", 2000, 2100, int(cfg["year"]), step=1, key="w_year")
+        month = cm.selectbox("Month", options=list(range(1, 13)),
+                             index=int(cfg["month"]) - 1,
+                             format_func=lambda m: calendar.month_name[m], key="w_month")
+
+        # -- Staff --------------------------------------------------------
+        st.markdown('<div class="kicker">Staff</div>', unsafe_allow_html=True)
+        st.caption("Add, remove, or rename employees — one per row.")
+        emp_df = st.data_editor(
+            st.session_state["_emp_seed"],
+            num_rows="dynamic", width="stretch", hide_index=True, key="w_emp",
+            column_config={"Employee": st.column_config.TextColumn(
+                "Employee", width="large", help="One row per person.")})
+        employees = [str(x).strip() for x in emp_df["Employee"].dropna().tolist()
+                     if str(x).strip()]
+
+        # Duplicate names crash the roster grid downstream (a non-unique index)
+        # and could produce a nonsense roster -- input hygiene, not a scheduling
+        # rule, so it's caught here rather than in the engine's preflight. Never
+        # silently deduped: the user must fix the list.
+        seen, dupe_names = set(), []
+        for name in employees:
+            if name in seen and name not in dupe_names:
+                dupe_names.append(name)
+            seen.add(name)
+        if dupe_names:
+            word = "name" if len(dupe_names) == 1 else "names"
+            st.error(f"Two rows have the same {word}: {', '.join(dupe_names)}. "
+                     "Give each person a unique name.")
+
+        # -- Night team ---------------------------------------------------
+        st.markdown('<div class="kicker">Night team</div>', unsafe_allow_html=True)
+        night_team = st.multiselect(
+            "Night-team members — they work nights only",
+            options=employees,
+            default=[e for e in cfg["night_team"] if e in employees],
+            key="w_night")
+        if not night_team:
+            st.caption("Pick at least one night-team member — they work nights only.")
         else:
-            st.session_state.pop("infeasible", None)
-            results = sch.validate(S, sol.grid)
-            st.session_state["result"] = {
-                "settings": S, "grid": sol.grid, "results": results,
-                "status": sol.status,
-                "xlsx": sch.export_bytes(S, sol.grid, results),
-            }
+            st.caption(f"{len(night_team)} of {len(employees)} staff on the night team.")
+
+        # -- AM shift -----------------------------------------------------
+        st.markdown('<div class="kicker">AM shift</div>', unsafe_allow_html=True)
+        st.caption("Staff who work the same weekdays every week. They appear on the "
+                   "roster as extra rows and don't count toward the daily staffing "
+                   "numbers. Leave empty if unused.")
+        am_df = st.data_editor(
+            st.session_state["_am_seed"],
+            num_rows="dynamic", width="stretch", hide_index=True, key="w_am",
+            column_config={"AM staff": st.column_config.TextColumn(
+                "AM staff", width="large", help="One row per AM-shift person.")})
+        am_team = [str(x).strip() for x in am_df["AM staff"].dropna().tolist()
+                   if str(x).strip()]
+        am_days = st.multiselect(
+            "AM working days", options=sch.WEEKDAY_NAMES,
+            default=[d for d in cfg["am_days"] if d in sch.WEEKDAY_NAMES], key="w_amdays",
+            help="The weekdays AM staff work every week (default Sun–Thu).")
+
+        # -- Leave ----------------------------------------------------------
+        st.markdown('<div class="kicker">Leave</div>', unsafe_allow_html=True)
+        st.caption("Vacation inside the month: those days are blocked ('V') and "
+                   "the person's shift target drops by one per leave day. One row "
+                   "per range; several rows per person are fine. Rows missing a "
+                   "name or a date are ignored.")
+        month_first = datetime.date(int(year), int(month), 1)
+        month_last = datetime.date(int(year), int(month),
+                                   calendar.monthrange(int(year), int(month))[1])
+        leave_df = st.data_editor(
+            st.session_state["_leave_seed"],
+            num_rows="dynamic", width="stretch", hide_index=True, key="w_leave",
+            column_config={
+                "Employee": st.column_config.SelectboxColumn(
+                    "Employee", options=employees, width="medium",
+                    help="Scheduled staff only — AM staff cannot take rostered leave."),
+                "From": st.column_config.DateColumn(
+                    "From", min_value=month_first, max_value=month_last),
+                "To": st.column_config.DateColumn(
+                    "To", min_value=month_first, max_value=month_last),
+            })
+        # Collect complete rows only (name + both dates); every rule-level check
+        # -- unknown names, reversed or out-of-month ranges -- stays in preflight.
+        leave = []
+        for _, lrow in leave_df.iterrows():
+            lname, d_from, d_to = lrow.get("Employee"), lrow.get("From"), lrow.get("To")
+            if pd.isna(lname) or not str(lname).strip() or pd.isna(d_from) or pd.isna(d_to):
+                continue
+            leave.append((str(lname).strip(),
+                          pd.Timestamp(d_from).date(), pd.Timestamp(d_to).date()))
+
+        # -- Adjust rules (collapsed; pre-filled from ScheduleSettings) ----
+        with st.expander("Adjust rules"):
+            st.caption("Pre-filled with the department defaults. Change these only if "
+                       "your rules differ.")
+
+            st.markdown("**Staffing per day**")
+            d1, d2 = st.columns(2)
+            day_min = d1.number_input("Min day staff", 0, 50, int(cfg["day_min"]),
+                                      key="w_daymin")
+            day_max = d2.number_input("Max day staff", 1, 50, int(cfg["day_max"]),
+                                      key="w_daymax")
+            n1, n2 = st.columns(2)
+            night_min = n1.number_input("Min night staff", 0, 10, int(cfg["night_min"]),
+                                        key="w_nmin")
+            night_max = n2.number_input("Max night staff (overlap)", 1, 10,
+                                        int(cfg["night_max"]), key="w_nmax")
+
+            st.markdown("**Workload**")
+            shifts = st.number_input("Shifts per employee (exact)", 1, 31,
+                                     int(cfg["shifts"]), key="w_shifts")
+
+            st.markdown("**Run lengths**")
+            r1, r2 = st.columns(2)
+            max_day = r1.number_input("Max day shifts in a row", 1, 14,
+                                      int(cfg["max_day"]), key="w_maxday")
+            max_night = r2.number_input("Max nights in a row", 1, 14,
+                                        int(cfg["max_night"]), key="w_maxnight")
+            r3, r4 = st.columns(2)
+            min_work = r3.number_input(
+                "Min work days in a row", 2, 7, int(cfg["min_work"]), disabled=True,
+                key="w_minwork",
+                help="Fixed at 2 — the schedule never leaves a single isolated work day.")
+            min_off = r4.number_input(
+                "Min days off in a row", 2, 7, int(cfg["min_off"]), disabled=True,
+                key="w_minoff",
+                help="Fixed at 2 — the schedule never leaves a single isolated day off.")
+            max_off = st.number_input("Max days off in a row", 1, 14,
+                                      int(cfg["max_off"]), key="w_maxoff")
+
+            st.markdown("**Weekends**")
+            alt_weekends = st.toggle(
+                "Alternating weekends", value=bool(cfg["alt_weekends"]), key="w_alt",
+                help="On: every employee's full Fri+Sat weekends strictly alternate "
+                     "off / on / off — of every two full weekends, exactly one is fully "
+                     "off. This is a firm rule, and it can make very tight months "
+                     "impossible to schedule; if that happens, turn it off and generate "
+                     "again.")
+
+            st.markdown("**Scheduling effort**")
+            effort = st.select_slider(
+                "Scheduling effort", options=EFFORT_LEVELS,
+                value=cfg["effort"] if cfg["effort"] in EFFORT_LEVELS else EFFORT_LEVELS[0],
+                key="w_effort", label_visibility="collapsed",
+                help="Higher effort searches longer for a better-balanced roster. With "
+                     "the same settings you always get the same roster.")
+
+        # Mirror every input into plain (non-widget) session_state so it survives
+        # Back navigation, when this step's widget keys are garbage-collected.
+        st.session_state.setup = {
+            "year": int(year), "month": int(month),
+            "employees": employees, "night_team": night_team,
+            "am_team": am_team, "am_days": list(am_days),
+            "leave": leave,
+            "day_min": int(day_min), "day_max": int(day_max),
+            "night_min": int(night_min), "night_max": int(night_max),
+            "shifts": int(shifts),
+            "max_day": int(max_day), "max_night": int(max_night),
+            "min_work": int(min_work), "min_off": int(min_off),
+            "max_off": int(max_off),
+            "alt_weekends": bool(alt_weekends),
+            "effort": effort,
+        }
+
+        st.divider()
+        _, col_next = st.columns([2, 1])
+        with col_next:
+            if st.button("Continue to check", type="primary", width="stretch",
+                         icon=":material/arrow_forward:", key="nav_1_next",
+                         disabled=bool(dupe_names)):
+                # Any change to the setup invalidates a previously generated roster.
+                if ("result" in st.session_state
+                        and st.session_state["result"]["sig"] != _sig(st.session_state.setup)):
+                    st.session_state.pop("result", None)
+                st.session_state.pop("gen_failed", None)
+                go_to(2)
 
 
 # ---------------------------------------------------------------------------
-# RENDER  (blocked? infeasible? else the result; otherwise the initial hint)
+# STEP 2 -- CHECK  (preflight runs automatically; Generate solves)
 # ---------------------------------------------------------------------------
 
-if "blocked" in st.session_state:
-    render_problems(
-        "This rule combination has no valid schedule — preflight stopped before "
-        "solving.", st.session_state["blocked"])
+def screen_check() -> None:
+    cfg = st.session_state.setup
+    S = make_settings(cfg)
+    problems = sch.preflight(S)
 
-if "infeasible" in st.session_state:
-    info = st.session_state["infeasible"]
-    st.error(
-        f"The solver could not satisfy every hard rule (status: {info['status']}). "
-        "The conflict is a combination of rules, not a single value. Try one of:")
-    for hint in info["hints"]:
-        st.markdown(f"- 💡 {hint}")
+    _, mid, _ = st.columns([1, 2.2, 1])
+    with mid:
+        if st.button("Back", icon=":material/arrow_back:", key="nav_2_back"):
+            go_to(1)
+        st.subheader("Check the setup")
 
-if "result" in st.session_state:
+        # (a) Preflight found problems -- show each message + suggestion, calmly.
+        if problems:
+            render_problems(problems)
+            st.divider()
+            if st.button("Back to setup", type="primary", width="stretch",
+                         icon=":material/arrow_back:", key="nav_2_fix"):
+                go_to(1)
+            return
+
+        # (b) A previous Generate on these settings found no valid roster.
+        if "gen_failed" in st.session_state:
+            st.error("No roster fits these rules together.")
+            st.markdown(
+                "Each rule is fine on its own, but together they leave no valid "
+                "schedule for this month — it's the combination, not a single wrong "
+                "value. Things to try:")
+            for hint in st.session_state["gen_failed"]["hints"]:
+                st.markdown(f"- {hint}")
+            st.divider()
+            if st.button("Back to setup", type="primary", width="stretch",
+                         icon=":material/arrow_back:", key="nav_2_infeasible"):
+                go_to(1)
+            return
+
+        # (c) Clean -- a stored roster for these exact settings means Back
+        # landed here after a Generate; offer to view it instead of stranding
+        # it behind a full re-solve. Otherwise, recap what Generate will build.
+        has_current_result = ("result" in st.session_state
+                              and st.session_state["result"]["sig"] == _sig(cfg))
+        if has_current_result:
+            st.success("This month's roster is ready. View it, or generate again "
+                       "if you'd like to reshuffle within the same settings.")
+        else:
+            st.success("Everything checks out. Here's what will be generated.")
+        with st.container(border=True):
+            recap(S)
+        st.divider()
+
+        if has_current_result:
+            col_view, col_regen = st.columns([2, 1])
+            with col_view:
+                if st.button("View roster", type="primary", width="stretch",
+                             icon=":material/table_chart:", key="nav_2_view"):
+                    go_to(3)
+            with col_regen:
+                generate_clicked = st.button(
+                    "Generate again", width="stretch",
+                    icon=":material/refresh:", key="nav_2_generate")
+        else:
+            generate_clicked = st.button(
+                "Generate roster", type="primary", width="stretch",
+                icon=":material/bolt:", key="nav_2_generate")
+
+        if generate_clicked:
+            with st.spinner("Building the roster…"):
+                sol = sch.build_and_solve(S)
+            if not sol.grid:
+                st.session_state["gen_failed"] = {"hints": sch.relaxation_hints(S)}
+                st.rerun()
+            else:
+                results = sch.validate(S, sol.grid)
+                st.session_state["result"] = {
+                    "settings": S, "grid": sol.grid, "results": results,
+                    "xlsx": sch.export_bytes(S, sol.grid, results),
+                    "sig": _sig(cfg),
+                }
+                st.session_state.pop("gen_failed", None)
+                go_to(3)
+
+
+# ---------------------------------------------------------------------------
+# STEP 3 -- ROSTER  (renders validate() results + the grid)
+# ---------------------------------------------------------------------------
+
+def screen_roster() -> None:
+    if "result" not in st.session_state:
+        _, mid, _ = st.columns([1, 2.2, 1])
+        with mid:
+            st.info("No roster has been generated yet.")
+            if st.button("Back to check", key="nav_3_empty"):
+                go_to(2)
+        return
+
     R = st.session_state["result"]
     S = R["settings"]
     results = R["results"]
     # Split hard vs fairness via the structured `kind` field (not by name).
     fairness = [r for r in results if r.kind == "fairness"]
     hard = [r for r in results if r.kind != "fairness"]
-    passed = sum(1 for r in results if r.passed)
+    hard_fail = [r for r in hard if not r.passed]
 
-    # --- Month header + compact metrics + a subtle solver status ------------
-    head_l, head_r = st.columns([2.3, 1.4])
-    with head_l:
-        st.markdown('<div class="kicker">Monthly Roster</div>', unsafe_allow_html=True)
+    _, mid, _ = st.columns([0.5, 11, 0.5])          # wide, so the grid is the hero
+    with mid:
+        if st.button("Back", icon=":material/arrow_back:", key="nav_3_back"):
+            go_to(2)
+        st.markdown('<div class="kicker">Monthly roster</div>', unsafe_allow_html=True)
         st.subheader(f"{S.month_label} · {S.days} days")
         st.caption(sch.roster_caption(S))
-        st.badge(f"Solver · {R['status']}", color="gray",
-                 icon=":material/check_small:")
-    with head_r:
-        m1, m2 = st.columns(2)
-        m1.metric("Employees", len(S.employees), border=True)
-        m2.metric("Rules passed", f"{passed}/{len(results)}", border=True)
 
-    # --- Positive, next-step status banner ----------------------------------
-    status_banner(hard, fairness)
+        # -- 3-way status banner (exact prior logic) --------------------
+        status_banner(hard, fairness)
 
-    # --- Prominent export, near the top of the results ----------------------
-    dl, _ = st.columns([1.4, 3])
-    dl.download_button(
-        "Download Excel (.xlsx)", data=R["xlsx"],
-        file_name=f"schedule_{S.year}_{S.month:02d}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary", icon=":material/download:", width="stretch")
-
-    st.write("")
-    tab_roster, tab_fair, tab_hard = st.tabs(["Roster", "Fairness", "Hard rules"])
-
-    # ======================= ROSTER (the hero) ==============================
-    with tab_roster:
+        # -- The color grid: the visual hero, with the legend -----------
+        st.markdown("##### Roster grid")
         legend(show_am=bool(S.am_team), show_leave=bool(S.leave))
         render_grid(S, R["grid"])
+
         st.divider()
         st.markdown("##### Daily coverage")
         render_coverage(S, R["grid"])
 
-    # ======================= FAIRNESS =======================================
-    with tab_fair:
+        st.divider()
+        st.markdown("##### Required rules")
+        st.caption("Every required rule re-checked independently from the finished "
+                   "grid. These are non-negotiable — all must pass to publish.")
+        render_checks(hard, full=False)
+        with st.expander("Technical detail"):
+            render_checks(hard)
+
+        st.divider()
         st.markdown("##### Fairness goals")
-        st.caption("Four soft, equally-weighted goals. Each PASSES when its measured "
-                   "spread (max − min) is within tolerance.")
-        cards = st.columns(len(fairness))
-        for col, r in zip(cards, fairness):
-            with col.container(border=True):
-                st.markdown(f"**{short_goal(r.name)}**")
-                if r.passed:
-                    st.badge("PASS", color="green", icon=":material/check_circle:")
-                else:
-                    st.badge("FAIL", color="red", icon=":material/cancel:")
-                st.caption(f"spread {r.spread} · tol {r.tolerance}")
-                # A goal can sit within tolerance yet still FAIL on a non-spread
-                # condition (e.g. the weekends goal also wants a full Fri+Sat off
-                # for everyone). Say so, so the card never looks self-contradictory;
-                # the full reason is in the checks table below.
-                if (not r.passed and r.spread is not None
-                        and r.tolerance is not None and r.spread <= r.tolerance):
-                    st.caption("Within tolerance, but another fairness condition "
-                               "isn't met — see the checks below.")
+        st.caption("Four goals, weighted equally. Each passes when its measured spread "
+                   "(max − min) is within tolerance; the weekends goal also needs every "
+                   "person to get at least one full Fri–Sat weekend off.")
+        fairness_cards(fairness)
 
         st.divider()
         st.markdown("##### Per-employee summary")
-        loads = sch.employee_loads(S, R["grid"])
-        fair_df = pd.DataFrame([{
-            "Employee": ld["name"] + (" ∗" if ld["night_member"] else ""),
-            "Total": ld["total"], "Leave": ld["leave"], "Target": ld["target"],
-            "Day": ld["day"], "Night": ld["night"],
-            "Fri/Sat": ld["weekend"], "Weekends off": ld["weekends_off"],
-            "Overlaps": ld["overlaps"], "Max-runs": ld["max_runs"],
-        } for ld in loads])
-        st.dataframe(fair_df, width="stretch", hide_index=True,
-                     height=min(80 + 35 * len(fair_df), 460))
-        st.caption("Overlaps = forced extra-night days worked · Max-runs = max-length "
-                   "day/night streaks absorbed · both are balanced within each pool "
-                   "(day-capable vs night-eligible).")
+        employee_table(S, R["grid"])
 
         st.divider()
-        st.markdown("##### Fairness checks")
-        render_checks(fairness)
+        _, col_next = st.columns([2, 1])
+        with col_next:
+            if hard_fail:
+                if st.button("Back to setup", type="primary", width="stretch",
+                             icon=":material/arrow_back:", key="nav_3_fix"):
+                    go_to(1)
+            else:
+                if st.button("Continue to export", type="primary", width="stretch",
+                             icon=":material/arrow_forward:", key="nav_3_next"):
+                    go_to(4)
 
-    # ======================= HARD RULES =====================================
-    with tab_hard:
-        st.markdown("##### Hard-rule validation")
-        st.caption("Every hard rule re-derived independently from the finished grid. "
-                   "These are non-negotiable — all must PASS to publish.")
-        render_checks(hard)
 
-elif "blocked" not in st.session_state and "infeasible" not in st.session_state:
-    # --- Initial / empty state: a calm hint -------------------------------
-    with st.container(border=True):
-        st.markdown("##### Build a monthly roster")
-        st.markdown(
-            "Set the month, staff, night team, and rules in the sidebar, "
-            "then press **Generate roster**. You'll get a color-coded grid, an "
-            "independent PASS/FAIL check of every rule, and a one-click Excel export.")
-        legend()
+# ---------------------------------------------------------------------------
+# STEP 4 -- EXPORT  (summary card + the Excel download)
+# ---------------------------------------------------------------------------
+
+def screen_export() -> None:
+    if "result" not in st.session_state:
+        _, mid, _ = st.columns([1, 2.2, 1])
+        with mid:
+            st.info("No roster has been generated yet.")
+            if st.button("Back to check", key="nav_4_empty"):
+                go_to(2)
+        return
+
+    R = st.session_state["result"]
+    S = R["settings"]
+    results = R["results"]
+    passed = sum(1 for r in results if r.passed)
+    # Defense in depth: the Roster step already blocks forward navigation on a
+    # hard-rule failure, but re-check here too in case this screen is reached
+    # some other way -- reading the stored kind/passed fields is display
+    # aggregation, not re-deriving a rule.
+    hard_fail = [r for r in results if r.kind != "fairness" and not r.passed]
+
+    _, mid, _ = st.columns([1, 2.2, 1])
+    with mid:
+        if st.button("Back", icon=":material/arrow_back:", key="nav_4_back"):
+            go_to(3)
+        st.subheader("Export the roster")
+        st.caption("Download the color-coded Excel workbook — the roster sheet plus a "
+                   "summary and rule-check sheet, matching what's on screen.")
+
+        if hard_fail:
+            st.error(
+                f"{len(hard_fail)} required rule(s) did not pass — do not publish "
+                f"this roster. Go back to the roster to review, or return to Setup "
+                f"to adjust and generate again.")
+
+        with st.container(border=True):
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Month", S.month_label)
+            m2.metric("Staff", len(S.employees))
+            m3.metric("Checks passed", f"{passed}/{len(results)}")
+
+        st.write("")
+        st.download_button(
+            "Download Excel (.xlsx)", data=R["xlsx"],
+            file_name=f"schedule_{S.year}_{S.month:02d}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary", icon=":material/download:", width="stretch", key="dl_xlsx")
+
+        st.divider()
+        if st.button("Start a new month", icon=":material/restart_alt:", key="nav_4_new"):
+            # Advance the mirrored month by one (December wraps to January of
+            # the next year) so Setup doesn't reopen on the month just
+            # exported. Everything else (staff, rules) intentionally survives.
+            next_cfg = dict(st.session_state.setup)
+            if next_cfg["month"] == 12:
+                next_cfg["month"], next_cfg["year"] = 1, next_cfg["year"] + 1
+            else:
+                next_cfg["month"] += 1
+            st.session_state.setup = next_cfg
+            st.session_state.pop("result", None)
+            st.session_state.pop("gen_failed", None)
+            go_to(1)
+
+
+# ---------------------------------------------------------------------------
+# ROUTER
+# ---------------------------------------------------------------------------
+
+render_header(st.session_state.step)
+
+if st.session_state.step == 1:
+    screen_setup()
+elif st.session_state.step == 2:
+    screen_check()
+elif st.session_state.step == 3:
+    screen_roster()
+elif st.session_state.step == 4:
+    screen_export()
