@@ -196,6 +196,14 @@ def _init_setup() -> dict:
     }
 
 
+def _leave_frame(rows: list) -> pd.DataFrame:
+    """The leave editor's seed frame for a list of (name, from, to) ranges."""
+    return pd.DataFrame(
+        {"Employee": pd.Series([r[0] for r in rows], dtype="object"),
+         "From": pd.Series([r[1] for r in rows], dtype="datetime64[ns]"),
+         "To": pd.Series([r[2] for r in rows], dtype="datetime64[ns]")})
+
+
 def _seed_editors() -> None:
     """(Re)build the three data_editor seed frames from the setup mirror.
 
@@ -204,16 +212,19 @@ def _seed_editors() -> None:
     stays on the screen. Rebuilding the seed from the mirror on every rerun
     (the mirror changes after each edit) flips the editor's widget identity,
     which silently reverts the second of two consecutive edits.
+
+    One deliberate exception: the leave editor's column_config depends on the
+    month (date bounds) and the staff list (name options), and a mid-visit
+    change to either flips its widget identity anyway -- screen_setup detects
+    that case by fingerprint and reseeds just the leave frame from the mirror,
+    so completed rows from this visit survive the reset.
     """
     cfg = st.session_state.setup
     st.session_state["_emp_seed"] = pd.DataFrame(
         {"Employee": pd.Series(list(cfg["employees"]), dtype="object")})
     st.session_state["_am_seed"] = pd.DataFrame(
         {"AM staff": pd.Series(list(cfg["am_team"]), dtype="object")})
-    st.session_state["_leave_seed"] = pd.DataFrame(
-        {"Employee": pd.Series([r[0] for r in cfg["leave"]], dtype="object"),
-         "From": pd.Series([r[1] for r in cfg["leave"]], dtype="datetime64[ns]"),
-         "To": pd.Series([r[2] for r in cfg["leave"]], dtype="datetime64[ns]")})
+    st.session_state["_leave_seed"] = _leave_frame(cfg["leave"])
 
 
 if "step" not in st.session_state:
@@ -610,6 +621,20 @@ def screen_setup() -> None:
         month_first = datetime.date(int(year), int(month), 1)
         month_last = datetime.date(int(year), int(month),
                                    calendar.monthrange(int(year), int(month))[1])
+        # The editor's column_config depends on the month (the date bounds
+        # above) and the staff list (the name options below), and Streamlit
+        # derives the editor's widget identity from that config -- so a
+        # mid-visit month or staff change resets the editor to its seed, which
+        # predates any rows completed this visit. The mirror still holds last
+        # rerun's parsed rows (complete rows only), so reseed from it when
+        # those inputs change.
+        # Safe: the identity flips on any fingerprint change anyway, so this
+        # never discards a live edit -- and rows left out-of-month or naming a
+        # removed employee stay visible for preflight to flag, never dropped.
+        leave_fp = (int(year), int(month), tuple(employees))
+        if st.session_state.get("_leave_cfg_fp") != leave_fp:
+            st.session_state["_leave_seed"] = _leave_frame(cfg["leave"])
+            st.session_state["_leave_cfg_fp"] = leave_fp
         leave_df = st.data_editor(
             st.session_state["_leave_seed"],
             num_rows="dynamic", width="stretch", hide_index=True, key="w_leave",
