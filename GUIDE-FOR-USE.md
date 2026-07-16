@@ -16,7 +16,9 @@ You don't need to know any coding. Just follow the steps below.
   day shifts).
 - Follows safety rules automatically:
   - never a **night shift followed by a day shift** the next morning,
-  - never more than **4 day shifts** in a row, or **3 nights** in a row,
+  - never more than **4 working shifts in a row** (day or night, combined — so a run like
+    four days then straight into a night still counts as 5 and isn't allowed), and within
+    that, never more than **3 nights** in a row,
   - it does its best to give everyone a **full Friday + Saturday weekend off** (and it
     tells you honestly if a tight month can't manage it),
   - rest days are spread out (never more than 4 days off in a row, never a single lonely off day).
@@ -119,7 +121,7 @@ but they're kept separate from the shift math above.
 ### 4 · Rules
 These are pre-set to safe values. You usually don't need to touch them:
 - Shifts per employee: **16**
-- Max day shifts in a row: **4** · Max nights in a row: **3**
+- Max working shifts in a row: **4** (day or night, combined) · Max nights in a row: **3**
 - Min work/off in a row: **2** · Max off in a row: **4**
 - **Alternating weekends** (off unless you switch it on): everyone's weekends go
   **off, on, off, on…** — every other Fri+Sat fully off, guaranteed. Two things to know:
@@ -176,7 +178,8 @@ you a schedule that quietly breaks a rule — it would rather stop and tell you.
 - **A dedicated night team** means rested night staff instead of everyone flipping between
   days and nights.
 - **No night → day next morning** protects against the most tiring, error-prone pattern.
-- **Max 3 nights / 4 days in a row** keeps fatigue down.
+- **Max 4 working shifts in a row (day or night, combined), and no more than 3 of those as
+  nights**, keeps fatigue down.
 - **A full weekend off for everyone** (whenever the month allows it) keeps it fair.
 - **Alternating weekends** (when on) spreads the weekends evenly over time — nobody is
   stuck working several weekends in a row while someone else always gets them off.
