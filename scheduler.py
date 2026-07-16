@@ -30,9 +30,10 @@ POLICY (this revision):
         and nights rotate across the whole roster. The night load is balanced as
         evenly as possible (a soft fairness goal), not pinned to a fixed total.
   * No Night->Day next-calendar-day transition for anyone.
-  * Day-shift runs are capped at `max_consec_work`; night runs at
-    `max_consec_night`; off runs floored at `min_consec_off`, capped at
-    `max_consec_off`; work runs floored at `min_consec_work`.
+  * Combined working runs (day or night, back to back) are capped at
+    `max_consec_work`; night runs at `max_consec_night`; off runs floored at
+    `min_consec_off`, capped at `max_consec_off`; work runs floored at
+    `min_consec_work`.
   * FAIRNESS is the top priority and is expressed as four soft, equally-weighted
     objective goals -- equal totals, balanced night load, balanced weekends, and
     balanced "undesirable runs" (forced overlaps + max-length streaks) -- each of
@@ -609,7 +610,10 @@ def preflight(settings: ScheduleSettings) -> list[Problem]:
                             f"more than {cap} {unit} straight.",
                             "Shorten or split the leave, or add cover for those days."))
 
-        pinned_problem(elig_pool, S.night_min, S.max_consec_night, "night",
+        # A pinned night run is also a combined working run, so the binding cap
+        # is the tighter of the night and combined-run limits.
+        pinned_problem(elig_pool, S.night_min,
+                       min(S.max_consec_night, S.max_consec_work), "night",
                        unit="nights")
         if pools_disjoint:
             pinned_problem(day_pool, S.day_min, S.max_consec_work, "day")
@@ -625,7 +629,7 @@ def preflight(settings: ScheduleSettings) -> list[Problem]:
         for e in range(n_emp):
             if not lv[e] or tgt[e] == 0:
                 continue
-            cap = (S.max_consec_night
+            cap = (min(S.max_consec_night, S.max_consec_work)
                    if not S.is_rotate and S.night_team_nights_only
                    and S.employees[e] in S.night_team
                    else S.max_consec_work)
@@ -1241,8 +1245,16 @@ def validate(settings: ScheduleSettings, grid: list[list[str]]) -> list[RuleResu
             f"{sum(len(x) for x in lv)} leave day(s) placed exactly as configured"
             if not mismatches else f"{len(mismatches)} mismatch(es): {mismatches[:6]}"))
 
-    totals = [sum(1 for d in range(days) if grid[e][d] not in (OFF, LEAVE))
-              for e in range(n)]
+    # Per-employee "working day" mask: a day counts as worked when it is neither
+    # OFF nor LEAVE. This one predicate is the ground truth for the shift totals,
+    # the max working-run cap, and the min working-run floor below, so derive it
+    # (and its run lengths) ONCE here -- structurally shared rather than the same
+    # test re-inlined at three sites where they could silently drift apart.
+    workday = [[grid[e][d] not in (OFF, LEAVE) for d in range(days)]
+               for e in range(n)]
+    work_runs = [_runs(workday[e]) for e in range(n)]
+
+    totals = [sum(workday[e]) for e in range(n)]
     if has_leave:
         results.append(RuleResult(
             "Shift totals match each employee's prorated target",
@@ -1297,12 +1309,11 @@ def validate(settings: ScheduleSettings, grid: list[list[str]]) -> list[RuleResu
     # The solver caps COMBINED working runs (day or night, since a run can mix
     # both shapes outside fixed_team's nights-only team -- see build_and_solve's
     # max_consec_work window over `work`, not just DAY cells). Re-derive the same
-    # quantity here with the not-in-(OFF, LEAVE) predicate the min-work check
-    # below already uses: a window of max_consec_work+1 cells with no O/V cell IS
-    # a working run longer than the cap, so longest-run and the solver's window
-    # encoding agree exactly.
-    max_work_run = max((max(_runs([grid[e][d] not in (OFF, LEAVE) for d in range(days)]),
-                           default=0)
+    # quantity here from the shared `work_runs` (the not-in-(OFF, LEAVE) working
+    # mask computed once above): a window of max_consec_work+1 cells with no O/V
+    # cell IS a working run longer than the cap, so longest-run and the solver's
+    # window encoding agree exactly.
+    max_work_run = max((max(work_runs[e], default=0)
                         for e in range(n)), default=0)
     results.append(RuleResult(
         f"Max {S.max_consec_work} consecutive working days",
@@ -1322,8 +1333,7 @@ def validate(settings: ScheduleSettings, grid: list[list[str]]) -> list[RuleResu
     # all-off month is not a rostered pattern.
     exempt = {e for e in range(n) if has_leave and tgt[e] == 0}
 
-    min_work_run = min((min(_runs([grid[e][d] not in (OFF, LEAVE) for d in range(days)]),
-                            default=S.min_consec_work)
+    min_work_run = min((min(work_runs[e], default=S.min_consec_work)
                         for e in range(n) if e not in exempt), default=S.min_consec_work)
     results.append(RuleResult(
         f"Min {S.min_consec_work} consecutive working days",

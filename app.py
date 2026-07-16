@@ -186,7 +186,7 @@ def _init_setup() -> dict:
         "night_min": defaults.night_min,
         "night_max": defaults.night_max,
         "shifts": defaults.shifts_per_employee,
-        "max_day": defaults.max_consec_work,
+        "max_work": defaults.max_consec_work,
         "max_night": defaults.max_consec_night,
         "min_work": defaults.min_consec_work,
         "min_off": defaults.min_consec_off,
@@ -263,7 +263,7 @@ def make_settings(cfg: dict) -> sch.ScheduleSettings:
         day_min=int(cfg["day_min"]), day_max=int(cfg["day_max"]),
         night_min=int(cfg["night_min"]), night_max=int(cfg["night_max"]),
         shifts_per_employee=int(cfg["shifts"]),
-        max_consec_work=int(cfg["max_day"]), max_consec_night=int(cfg["max_night"]),
+        max_consec_work=int(cfg["max_work"]), max_consec_night=int(cfg["max_night"]),
         min_consec_work=int(cfg["min_work"]), min_consec_off=int(cfg["min_off"]),
         max_consec_off=int(cfg["max_off"]),
         alternating_weekends=bool(cfg["alt_weekends"]),
@@ -507,9 +507,11 @@ def recap(S: sch.ScheduleSettings) -> None:
                     f"blocked and each person's shift target drops to match")
     st.markdown(f"- Each day: {S.day_min}–{S.day_max} day staff, "
                 f"{S.night_min}–{S.night_max} night staff")
+    night_note = (f" (nights capped tighter at {S.max_consec_night})"
+                  if S.max_consec_night < S.max_consec_work else "")
     st.markdown(f"- {S.shifts_per_employee} shifts per person; at most "
-                f"{S.max_consec_work} working shifts in a row "
-                f"(nights capped tighter at {S.max_consec_night})")
+                f"{S.max_consec_work} working shifts in a row"
+                f"{night_note}")
     if S.alternating_weekends:
         st.markdown("- Alternating weekends: on")
 
@@ -681,8 +683,8 @@ def screen_setup() -> None:
 
             st.markdown("**Run lengths**")
             r1, r2 = st.columns(2)
-            max_day = r1.number_input("Max working shifts in a row", 1, 14,
-                                      int(cfg["max_day"]), key="w_maxday")
+            max_work = r1.number_input("Max working shifts in a row", 1, 14,
+                                       int(cfg["max_work"]), key="w_maxwork")
             max_night = r2.number_input("Max nights in a row", 1, 14,
                                         int(cfg["max_night"]), key="w_maxnight")
             r3, r4 = st.columns(2)
@@ -724,7 +726,7 @@ def screen_setup() -> None:
             "day_min": int(day_min), "day_max": int(day_max),
             "night_min": int(night_min), "night_max": int(night_max),
             "shifts": int(shifts),
-            "max_day": int(max_day), "max_night": int(max_night),
+            "max_work": int(max_work), "max_night": int(max_night),
             "min_work": int(min_work), "min_off": int(min_off),
             "max_off": int(max_off),
             "alt_weekends": bool(alt_weekends),
