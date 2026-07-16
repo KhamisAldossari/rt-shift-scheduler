@@ -123,7 +123,7 @@ class ScheduleSettings:
     hours_per_shift: int = 12                       # one shift = 12 h (Hours col)
 
     # --- Run lengths --------------------------------------------------------
-    max_consec_work: int = 4                        # day-shift / working run cap
+    max_consec_work: int = 4                        # combined working (day+night) run cap
     max_consec_night: int = 3                       # night run cap (priority)
     min_consec_work: int = 2                        # no isolated single work day
     min_consec_off: int = 2                         # no isolated single off day
@@ -583,7 +583,7 @@ def preflight(settings: ScheduleSettings) -> list[Problem]:
         # floor, every free member must work; anyone free through such a stretch
         # for longer than the pool's run cap is forced over the cap -- provably
         # infeasible even though the capacity sums and per-day floors pass.
-        def pinned_problem(pool, floor, cap, what):
+        def pinned_problem(pool, floor, cap, what, unit="days"):
             if floor <= 0:
                 return
             d = 0
@@ -606,10 +606,11 @@ def preflight(settings: ScheduleSettings) -> list[Problem]:
                         problems.append(Problem(
                             f"Leave pins the {what} crew at its minimum on "
                             f"D{a + 1}-D{b + 1}, forcing {S.employees[e]} to work "
-                            f"more than {cap} days straight.",
+                            f"more than {cap} {unit} straight.",
                             "Shorten or split the leave, or add cover for those days."))
 
-        pinned_problem(elig_pool, S.night_min, S.max_consec_night, "night")
+        pinned_problem(elig_pool, S.night_min, S.max_consec_night, "night",
+                       unit="nights")
         if pools_disjoint:
             pinned_problem(day_pool, S.day_min, S.max_consec_work, "day")
         else:
@@ -739,7 +740,7 @@ def relaxation_hints(settings: ScheduleSettings) -> list[str]:
     hints = [
         f"Widen the day-staffing band (e.g. max day staff {S.day_max} -> {S.day_max + 1}).",
         f"Raise max consecutive off ({S.max_consec_off} -> {S.max_consec_off + 1}) "
-        f"or max consecutive day run ({S.max_consec_work} -> {S.max_consec_work + 1}).",
+        f"or max consecutive working run ({S.max_consec_work} -> {S.max_consec_work + 1}).",
         f"Allow more night overlap (max nights/day {S.night_max} -> {S.night_max + 1}).",
         "Reduce shifts/employee by 1 to loosen the packing.",
     ]
@@ -851,7 +852,7 @@ def build_and_solve(settings: ScheduleSettings) -> Solution:
             continue
         w = [work[(e, d)] for d in range(days)]
 
-        # Max consecutive WORKING days (day-shift / working run cap).
+        # Max consecutive WORKING days (combined day+night run cap).
         for start in range(days - S.max_consec_work):
             model.Add(sum(w[start:start + S.max_consec_work + 1]) <= S.max_consec_work)
 
@@ -1293,12 +1294,20 @@ def validate(settings: ScheduleSettings, grid: list[list[str]]) -> list[RuleResu
         not nd,
         f"{len(nd)} transitions" + ("" if not nd else f": {nd[:6]}")))
 
-    max_day_run = max((max(_runs([grid[e][d] == DAY for d in range(days)]), default=0)
-                       for e in range(n)), default=0)
+    # The solver caps COMBINED working runs (day or night, since a run can mix
+    # both shapes outside fixed_team's nights-only team -- see build_and_solve's
+    # max_consec_work window over `work`, not just DAY cells). Re-derive the same
+    # quantity here with the not-in-(OFF, LEAVE) predicate the min-work check
+    # below already uses: a window of max_consec_work+1 cells with no O/V cell IS
+    # a working run longer than the cap, so longest-run and the solver's window
+    # encoding agree exactly.
+    max_work_run = max((max(_runs([grid[e][d] not in (OFF, LEAVE) for d in range(days)]),
+                           default=0)
+                        for e in range(n)), default=0)
     results.append(RuleResult(
-        f"Max {S.max_consec_work} consecutive day shifts",
-        max_day_run <= S.max_consec_work,
-        f"longest day streak={max_day_run}"))
+        f"Max {S.max_consec_work} consecutive working days",
+        max_work_run <= S.max_consec_work,
+        f"longest working streak={max_work_run}"))
 
     max_night_run = max((max(_runs([grid[e][d] == NIGHT for d in range(days)]), default=0)
                          for e in range(n)), default=0)

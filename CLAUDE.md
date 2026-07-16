@@ -54,8 +54,9 @@ thin front-end over the engine.
   `night_min/night_max` band must stay consistent or the model goes infeasible.
 - **Night coverage is a band `[night_min, night_max]`**, never below `night_min` (a night
   is never uncovered). Default `[1, 2]`.
-- **Fatigue caps:** day runs ≤ `max_consec_work` (4), night runs ≤ `max_consec_night` (3),
-  **no Night→Day next day**. These are hard. Don't relax to "make it fit."
+- **Fatigue caps:** combined working runs (day or night, back to back) ≤ `max_consec_work`
+  (4), night runs ≤ `max_consec_night` (3), **no Night→Day next day**. These are hard.
+  Don't relax to "make it fit."
 - **The min-run encoding only supports a minimum of 2.** `build_and_solve()` has an
   `assert min_consec_work == 2 and min_consec_off == 2`. If you ever need a different
   minimum, generalize the neighbour-encoding constraints first; `preflight()` also guards

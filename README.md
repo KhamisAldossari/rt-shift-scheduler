@@ -23,8 +23,8 @@ reports each as **PASS/FAIL** with the measured value.
   roster, but it is not exposed in the web UI.
 - **Smart night coverage** — at least 1 night every day, with overlap above the floor only
   on the days the math forces it (never a free-for-all).
-- **Fatigue rules** — no Night→Day next-day flip, day runs ≤ 4, night runs ≤ 3,
-  off runs 2–4, work runs ≥ 2.
+- **Fatigue rules** — no Night→Day next-day flip, working runs (day or night) ≤ 4,
+  night runs ≤ 3, off runs 2–4, work runs ≥ 2.
 - **Fairness, four ways** — equal totals, balanced night load, balanced weekends (even
   Fri/Sat duty + a full weekend off each), and balanced "undesirable runs" (overlaps +
   max-length streaks) spread so no one absorbs the rough patterns. Each is reported
@@ -130,7 +130,7 @@ ScheduleSettings ──▶ preflight() ──▶ build_and_solve() ──▶ val
 | `day_min`, `day_max` | 2, 4 | Day staff required per day |
 | `night_min`, `night_max` | 1, 2 | Night coverage band per day |
 | `shifts_per_employee` | 16 | **Exact** monthly total per person |
-| `max_consec_work` | 4 | Max consecutive day-shift run |
+| `max_consec_work` | 4 | Max consecutive working run (day or night, combined) |
 | `max_consec_night` | 3 | Max consecutive night run |
 | `min_consec_work` | 2 | Min consecutive work (must be 2) |
 | `min_consec_off` | 2 | Min consecutive off (must be 2) |
@@ -156,8 +156,9 @@ ScheduleSettings ──▶ preflight() ──▶ build_and_solve() ──▶ val
 **Hard** (modeled as CP-SAT constraints, can never be violated):
 exactly-16 shifts · day staffing within `[day_min, day_max]` · night coverage within
 `[night_min, night_max]` (never uncovered) · nights worked only by the night team, and the
-night team works nights only *(fixed-team mode)* · no Night→Day next day · day runs ≤
-`max_consec_work` · night runs ≤ `max_consec_night` · work runs ≥ 2 · off runs ≥ 2 and ≤
+night team works nights only *(fixed-team mode)* · no Night→Day next day · combined
+working runs (day or night) ≤ `max_consec_work` · night runs ≤ `max_consec_night` ·
+work runs ≥ 2 · off runs ≥ 2 and ≤
 `max_consec_off` · alternating weekends *(when `alternating_weekends` is on — every
 employee's full Fri+Sat weekends alternate off/on, one fully off of each consecutive pair)*.
 

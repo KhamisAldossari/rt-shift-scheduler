@@ -508,7 +508,8 @@ def recap(S: sch.ScheduleSettings) -> None:
     st.markdown(f"- Each day: {S.day_min}–{S.day_max} day staff, "
                 f"{S.night_min}–{S.night_max} night staff")
     st.markdown(f"- {S.shifts_per_employee} shifts per person; at most "
-                f"{S.max_consec_work} day / {S.max_consec_night} night shifts in a row")
+                f"{S.max_consec_work} working shifts in a row "
+                f"(nights capped tighter at {S.max_consec_night})")
     if S.alternating_weekends:
         st.markdown("- Alternating weekends: on")
 
@@ -680,7 +681,7 @@ def screen_setup() -> None:
 
             st.markdown("**Run lengths**")
             r1, r2 = st.columns(2)
-            max_day = r1.number_input("Max day shifts in a row", 1, 14,
+            max_day = r1.number_input("Max working shifts in a row", 1, 14,
                                       int(cfg["max_day"]), key="w_maxday")
             max_night = r2.number_input("Max nights in a row", 1, 14,
                                         int(cfg["max_night"]), key="w_maxnight")
