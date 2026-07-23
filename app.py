@@ -99,9 +99,11 @@ st.set_page_config(
 )
 
 # A small amount of CSS, scoped to OUR OWN markup only (the app bar, the wizard
-# stepper, kicker labels, and the grid legend) so we never fight Streamlit's
-# internals across versions. Palette and typography come from
-# .streamlit/config.toml; grid colors from WEB_COLORS.
+# stepper, kicker labels, the grid legend, and the footer) so we never fight
+# Streamlit's internals across versions -- with one deliberate exception at the
+# bottom of the block that hides the platform's own "Created by / Hosted with
+# Streamlit" badge, so our footer is the only credit line. Palette and
+# typography come from .streamlit/config.toml; grid colors from WEB_COLORS.
 st.markdown(
     """
     <style>
@@ -136,6 +138,15 @@ st.markdown(
         border:1px solid rgba(28,43,42,.14);display:inline-block}
       .legend-code{font-weight:700;color:#1C2B2A}
       .legend-star{color:#0E7569;font-weight:700;font-size:1.05rem;line-height:1}
+
+      .footer{text-align:center;margin:3rem 0 .4rem;padding-top:1rem;
+        border-top:1px solid #E4E2DC;font-size:.78rem;letter-spacing:.05em;
+        color:#6E6F68}
+      .footer .name{color:#0E7569;font-weight:600}
+
+      /* The exception: the host's credit badge ships with hashed class names
+         (viewerBadge_container__..., etc.), so match on the stable prefix. */
+      footer, [class*="viewerBadge"]{display:none !important}
     </style>
     """,
     unsafe_allow_html=True,
@@ -988,3 +999,10 @@ elif st.session_state.step == 3:
     screen_roster()
 elif st.session_state.step == 4:
     screen_export()
+
+# Credit line on every screen; the platform's own badge is hidden by the CSS
+# block up top so this stays the only footer.
+st.markdown(
+    '<div class="footer">By <span class="name">Mishary Aldossary</span></div>',
+    unsafe_allow_html=True,
+)
