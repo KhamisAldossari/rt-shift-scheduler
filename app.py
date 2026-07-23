@@ -1003,6 +1003,6 @@ elif st.session_state.step == 4:
 # Credit line on every screen; the platform's own badge is hidden by the CSS
 # block up top so this stays the only footer.
 st.markdown(
-    '<div class="footer">By <span class="name">Mishary Aldossary</span></div>',
+    '<div class="footer">By <span class="name">Meshari Aldossary</span></div>',
     unsafe_allow_html=True,
 )
